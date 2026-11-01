@@ -11,7 +11,7 @@ use std::{
 };
 use walkdir::WalkDir;
 
-const PLAN_VERSION: u64 = 2;
+const PLAN_VERSION: u64 = 3;
 
 fn versioned_json(path: &Path, manifest: bool) -> io::Result<serde_json::Value> {
     let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
@@ -76,27 +76,62 @@ pub fn build_plan(
             Err(e) => Some(Err(io::Error::other(e))),
         })
         .collect::<io::Result<_>>()?;
-    let mut entries: Vec<Entry> = paths
+    let planned: Vec<Vec<Entry>> = paths
         .par_iter()
         .map(|path| {
             let relative = path.strip_prefix(&root).map_err(io::Error::other)?;
             let (size, hash) = hash_input(path)?;
-            let action = adapter.classify(&root, relative, &engine, &settings)?;
-            Ok(Entry {
-                path: StoredPath(relative.to_owned()),
-                size,
-                hash,
-                action,
-            })
+            let mut action = adapter.classify(&root, relative, &engine, &settings)?;
+            let members = adapter.expand(&root, relative, &engine, &settings)?;
+            let mut expanded = Vec::new();
+            if let Some(members) = members {
+                if members
+                    .iter()
+                    .any(|member| matches!(member.action, Action::Convert { .. }))
+                {
+                    if !matches!(action, Action::Rebuild { .. }) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "expandable pack has no rebuild format",
+                        ));
+                    }
+                    expanded.extend(members.into_iter().map(|member| Entry {
+                        path: StoredPath(relative.to_owned()),
+                        member: Some(member.member),
+                        size: member.size,
+                        hash: member.hash,
+                        action: member.action,
+                    }));
+                } else {
+                    action = Action::Copy {
+                        reason: "no member converted".into(),
+                    };
+                }
+            }
+            expanded.insert(
+                0,
+                Entry {
+                    path: StoredPath(relative.to_owned()),
+                    member: None,
+                    size,
+                    hash,
+                    action,
+                },
+            );
+            Ok(expanded)
         })
         .collect::<io::Result<_>>()?;
-    entries.sort_by(|a, b| a.path.0.cmp(&b.path.0));
+    let mut entries: Vec<Entry> = planned.into_iter().flatten().collect();
+    entries.sort_by(|a, b| a.path.0.cmp(&b.path.0).then(a.member.cmp(&b.member)));
     let notes = adapter.plan_notes(&root, &engine, &settings, &entries);
     engine.notes.extend(notes);
     let mut tools: Vec<ToolSpec> = Vec::new();
     for entry in &entries {
-        if let Action::Convert { kind, settings, .. } = &entry.action {
-            let transformer = transformers.get(kind).ok_or_else(|| {
+        if let Action::Convert {
+            encoder, settings, ..
+        } = &entry.action
+        {
+            let transformer = transformers.get(encoder).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     "no transformer registered for planned media",
@@ -116,7 +151,7 @@ pub fn build_plan(
         }
     }
     Ok(Plan {
-        plan_version: 2,
+        plan_version: 3,
         input_root: StoredPath(root),
         engine,
         settings,
@@ -153,6 +188,7 @@ pub fn validate_plan(plan: &Plan, root: &Path) -> io::Result<()> {
     let mut expected: Vec<PathBuf> = plan
         .entries
         .iter()
+        .filter(|entry| entry.member.is_none())
         .map(|entry| root.join(&entry.path.0))
         .collect();
     expected.sort();
@@ -162,17 +198,20 @@ pub fn validate_plan(plan: &Plan, root: &Path) -> io::Result<()> {
             "plan input file set changed",
         ));
     }
-    plan.entries.par_iter().try_for_each(|entry| {
-        let (size, hash) = hash_input(&root.join(&entry.path.0))?;
-        if size != entry.size || hash != entry.hash {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("stale plan: {}", entry.path.0.display()),
-            ))
-        } else {
-            Ok(())
-        }
-    })
+    plan.entries
+        .par_iter()
+        .filter(|entry| entry.member.is_none())
+        .try_for_each(|entry| {
+            let (size, hash) = hash_input(&root.join(&entry.path.0))?;
+            if size != entry.size || hash != entry.hash {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("stale plan: {}", entry.path.0.display()),
+                ))
+            } else {
+                Ok(())
+            }
+        })
 }
 
 #[cfg(test)]
@@ -198,6 +237,129 @@ mod tests {
                 reason: "fixture".into(),
             })
         }
+    }
+    struct PackAdapter(bool);
+    impl EngineAdapter for PackAdapter {
+        fn id(&self) -> &'static str {
+            "pack"
+        }
+        fn detect(&self, _: &Path) -> io::Result<Option<EngineInfo>> {
+            unreachable!()
+        }
+        fn classify(
+            &self,
+            _: &Path,
+            _: &Path,
+            _: &EngineInfo,
+            _: &ResolvedSettings,
+        ) -> io::Result<Action> {
+            Ok(Action::Rebuild {
+                format: "fake-pack".into(),
+            })
+        }
+        fn expand(
+            &self,
+            _: &Path,
+            _: &Path,
+            _: &EngineInfo,
+            settings: &ResolvedSettings,
+        ) -> io::Result<Option<Vec<crate::registry::MemberPlan>>> {
+            let action = if self.0 {
+                Action::Convert {
+                    kind: crate::MediaKind::Image,
+                    target: "webp".into(),
+                    encoder: "fake".into(),
+                    settings: crate::ConvertSettings::Image(settings.image()),
+                }
+            } else {
+                Action::Copy {
+                    reason: "test".into(),
+                }
+            };
+            Ok(Some(vec![
+                crate::registry::MemberPlan {
+                    member: "a".into(),
+                    size: 1,
+                    hash: "a".into(),
+                    action,
+                },
+                crate::registry::MemberPlan {
+                    member: "b".into(),
+                    size: 1,
+                    hash: "b".into(),
+                    action: Action::Copy {
+                        reason: "test".into(),
+                    },
+                },
+            ]))
+        }
+    }
+    struct FakeTransformer;
+    impl crate::registry::Transformer for FakeTransformer {
+        fn kind(&self) -> crate::MediaKind {
+            crate::MediaKind::Image
+        }
+        fn required_tools(&self) -> Vec<ToolSpec> {
+            vec![]
+        }
+        fn transform<'a>(
+            &'a self,
+            _: &'a Path,
+            _: &'a Path,
+            _: &'a crate::ConvertSettings,
+            _: &'a tokio_util::sync::CancellationToken,
+        ) -> crate::registry::Operation<'a, Option<String>> {
+            Box::pin(async { unreachable!() })
+        }
+        fn validate<'a>(
+            &'a self,
+            _: &'a Path,
+            _: &'a Path,
+            _: &'a crate::ConvertSettings,
+            _: &'a tokio_util::sync::CancellationToken,
+        ) -> crate::registry::Operation<'a, ()> {
+            Box::pin(async { unreachable!() })
+        }
+    }
+    #[test]
+    fn expands_only_packs_with_a_conversion() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(temp.path().join("game.pck"), b"pack")?;
+        let engine = EngineInfo {
+            name: "fake".into(),
+            version: None,
+            excluded_paths: vec![],
+            notes: vec![],
+            version_check_overridden: false,
+        };
+        let mut registry = TransformerRegistry::default();
+        registry.register("fake", std::sync::Arc::new(FakeTransformer));
+        let plan = build_plan(
+            temp.path(),
+            &PackAdapter(true),
+            engine.clone(),
+            ResolvedSettings::default(),
+            &registry,
+        )?;
+        assert_eq!(plan.entries.len(), 3);
+        assert!(matches!(plan.entries[0].action, Action::Rebuild { .. }));
+        assert_eq!(
+            plan.entries.iter().filter(|e| e.member.is_some()).count(),
+            2
+        );
+        validate_plan(&plan, temp.path())?;
+        let plan = build_plan(
+            temp.path(),
+            &PackAdapter(false),
+            engine,
+            ResolvedSettings::default(),
+            &registry,
+        )?;
+        assert_eq!(plan.entries.len(), 1);
+        assert!(
+            matches!(&plan.entries[0].action, Action::Copy { reason } if reason == "no member converted")
+        );
+        Ok(())
     }
     #[test]
     fn saved_plan_rejects_changed_content() -> io::Result<()> {

@@ -3,13 +3,14 @@ use crate::{
     journal::{self, Journal, JournalEntry, Report},
     output::check_output,
     planning::{hash_input, validate_plan},
-    registry::TransformerRegistry,
+    registry::{PackRegistry, TransformerRegistry},
     scheduler::{transform_one_with_force, ConversionOutcome},
     tools::check_tools,
     Action, Plan, StoredPath,
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, HashMap},
     io,
     path::{Component, Path},
     sync::{
@@ -80,6 +81,30 @@ pub async fn run_job_with_force(
     force: CancellationToken,
     events: broadcast::Sender<Event>,
 ) -> io::Result<Report> {
+    run_job_with_packs(
+        plan,
+        output,
+        registry,
+        &PackRegistry::default(),
+        jobs,
+        cancel,
+        force,
+        events,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_job_with_packs(
+    plan: &Plan,
+    output: &Path,
+    registry: &TransformerRegistry,
+    packs: &PackRegistry,
+    jobs: usize,
+    cancel: CancellationToken,
+    force: CancellationToken,
+    events: broadcast::Sender<Event>,
+) -> io::Result<Report> {
     if jobs == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -105,6 +130,34 @@ pub async fn run_job_with_force(
             ));
         }
     }
+    // Cache each source directory once; reject malformed plans before creating output.
+    let mut pack_dirs = HashMap::new();
+    for entry in &plan.entries {
+        if let Action::Rebuild { format } = &entry.action {
+            let handler = packs.get(format).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("missing pack format: {format}"),
+                )
+            })?;
+            let directory = handler.read_directory(&plan.input_root.0.join(&entry.path.0))?;
+            pack_dirs.insert(entry.path.clone(), (handler, directory));
+        }
+    }
+    for entry in plan.entries.iter().filter(|entry| entry.member.is_some()) {
+        let (_, directory) = pack_dirs.get(&entry.path).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "member has no rebuild entry")
+        })?;
+        if !directory
+            .iter()
+            .any(|item| Some(&item.name) == entry.member.as_ref())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "member missing from pack",
+            ));
+        }
+    }
     let tools = check_tools(plan)?;
     std::fs::create_dir_all(metadata.join("tmp"))?;
     journal::write_json_atomic(&metadata.join("plan.json"), plan)?;
@@ -124,13 +177,18 @@ pub async fn run_job_with_force(
     // Shared (done, bytes saved) snapshot for start events sent from workers.
     let progress = Arc::new((AtomicUsize::new(0), AtomicI64::new(0)));
     for (index, entry) in plan.entries.iter().enumerate() {
-        if let Some(record) = completed.get(&entry.path) {
+        if matches!(entry.action, Action::Rebuild { .. }) {
+            continue;
+        }
+        if let Some(record) = completed.get(&(entry.path.clone(), entry.member.clone())) {
             done += 1;
-            saved += i128::from(record.input_size) - i128::from(record.output_size);
+            if record.member.is_none() {
+                saved += i128::from(record.input_size) - i128::from(record.output_size);
+            }
             progress.0.store(done, Ordering::Relaxed);
             progress.1.store(saved as i64, Ordering::Relaxed);
             let _ = events.send(Event::FileResult {
-                path: entry.path.clone(),
+                path: journal::display_path(&entry.path, entry.member.as_deref()),
                 outcome: record.outcome.clone(),
                 done,
                 total,
@@ -139,13 +197,24 @@ pub async fn run_job_with_force(
             continue;
         }
         let transformer = match &entry.action {
-            Action::Convert { kind, .. } => Some(
+            Action::Convert { encoder, .. } => Some(
                 registry
-                    .get(kind)
+                    .get(encoder)
                     .ok_or_else(|| io::Error::other("missing transformer"))?,
             ),
             _ => None,
         };
+        let pack_member = entry.member.as_ref().map(|name| {
+            let (handler, directory) = &pack_dirs[&entry.path];
+            (
+                handler.clone(),
+                directory
+                    .iter()
+                    .find(|item| &item.name == name)
+                    .unwrap()
+                    .clone(),
+            )
+        });
         let entry = entry.clone();
         let root = plan.input_root.0.clone();
         let output = output.clone();
@@ -160,28 +229,56 @@ pub async fn run_job_with_force(
             let _permit = tokio::select! { p=semaphore.acquire_owned()=>p.map_err(io::Error::other)?, _=token.cancelled()=>return Err(io::Error::new(io::ErrorKind::Interrupted,"cancelled")) };
             if token.is_cancelled() { return Err(io::Error::new(io::ErrorKind::Interrupted,"cancelled")); }
             let _ = events.send(Event::FileStart {
-                path: entry.path.clone(),
+                path: journal::display_path(&entry.path, entry.member.as_deref()),
                 done: progress.0.load(Ordering::Relaxed),
                 total,
                 bytes_saved: i128::from(progress.1.load(Ordering::Relaxed)),
             });
-            let path = entry.path.clone(); let destination=output.join(&path.0); ensure_output_parent(&output, &path.0)?;
+            let path = entry.path.clone();
             let action = async {
-                let (outcome, failure, exists) = match (&entry.action, transformer) {
-                    (Action::Convert { settings, .. }, Some(t)) => match transform_one_with_force(root.join(&path.0), destination.clone(), temporary.clone(), settings.clone(), t, &token, &force).await? {
-                        ConversionOutcome::Converted { note } => (note.map_or_else(|| "converted".to_owned(), |n| format!("converted; {n}")), false, true),
-                        ConversionOutcome::KeptOriginal { reason, failed } => (reason, failed, true),
-                    },
-                    (Action::Copy { reason } | Action::Skip { reason }, _) => {
-                        match copy::stage_copy_entry(&root, &output, &path.0, &temporary)? {
+                if let Some((handler, member)) = pack_member {
+                    let source = temporary.with_extension("src");
+                    let destination = output.join(".compressor/members").join(index.to_string());
+                    let (outcome, failure, hash, size) = match (&entry.action, transformer) {
+                        (Action::Convert { settings, .. }, Some(t)) => {
+                            let bytes = handler.read_member(&root.join(&path.0), &member)?;
+                            if bytes.len() as u64 != entry.size || blake3::hash(&bytes).to_hex().as_str() != entry.hash {
+                                return Err(io::Error::new(io::ErrorKind::InvalidData, "stale pack member"));
+                            }
+                            tokio::fs::write(&source, bytes).await?;
+                            let result = transform_one_with_force(source.clone(), destination.clone(), temporary.clone(), settings.clone(), t, &token, &force).await;
+                            let _ = tokio::fs::remove_file(&source).await;
+                            match result? {
+                                ConversionOutcome::Converted { note } => {
+                                    let (size, hash) = hash_input(&destination)?;
+                                    (note.map_or_else(|| "converted".to_owned(), |n| format!("converted; {n}")), false, hash, size)
+                                }
+                                ConversionOutcome::KeptOriginal { reason, failed } => {
+                                    let _ = tokio::fs::remove_file(&destination).await;
+                                    (reason, failed, entry.hash.clone(), entry.size)
+                                }
+                            }
+                        }
+                        (Action::Copy { reason } | Action::Skip { reason }, _) => (reason.clone(), false, entry.hash.clone(), entry.size),
+                        _ => return Err(io::Error::other("invalid member action")),
+                    };
+                    Ok(JournalEntry { path, member: entry.member, plan_hash, input_hash: entry.hash, output_hash: Some(hash), input_size: entry.size, output_size: size, outcome, failure })
+                } else {
+                    let destination=output.join(&path.0); ensure_output_parent(&output, &path.0)?;
+                    let (outcome, failure, exists) = match (&entry.action, transformer) {
+                        (Action::Convert { settings, .. }, Some(t)) => match transform_one_with_force(root.join(&path.0), destination.clone(), temporary.clone(), settings.clone(), t, &token, &force).await? {
+                            ConversionOutcome::Converted { note } => (note.map_or_else(|| "converted".to_owned(), |n| format!("converted; {n}")), false, true),
+                            ConversionOutcome::KeptOriginal { reason, failed } => (reason, failed, true),
+                        },
+                        (Action::Copy { reason } | Action::Skip { reason }, _) => match copy::stage_copy_entry(&root, &output, &path.0, &temporary)? {
                             CopyOutcome::Copied => { if token.is_cancelled() { return Err(io::Error::new(io::ErrorKind::Interrupted,"cancelled")); } tokio::fs::rename(&temporary, &destination).await?; (reason.clone(), false, true) },
                             CopyOutcome::Skipped(reason) => (reason, false, false),
-                        }
-                    },
-                    _ => return Err(io::Error::other("missing transformer")),
-                };
-                let (size, hash) = if exists { let (size, hash)=hash_input(&destination)?; (size,Some(hash)) } else { (0,None) };
-                Ok(JournalEntry { path, plan_hash, input_hash:entry.hash, output_hash:hash, input_size:entry.size, output_size:size, outcome, failure })
+                        },
+                        _ => return Err(io::Error::other("missing transformer")),
+                    };
+                    let (size, hash) = if exists { let (size, hash)=hash_input(&destination)?; (size,Some(hash)) } else { (0,None) };
+                    Ok(JournalEntry { path, member: None, plan_hash, input_hash:entry.hash, output_hash:hash, input_size:entry.size, output_size:size, outcome, failure })
+                }
             }.await;
             if action.is_err() { let _=tokio::fs::remove_file(&temporary).await; }
             action
@@ -196,11 +293,13 @@ pub async fn run_job_with_force(
                     .map_err(|_| io::Error::other("journal lock poisoned"))?
                     .append(&record)?;
                 done += 1;
-                saved += i128::from(record.input_size) - i128::from(record.output_size);
+                if record.member.is_none() {
+                    saved += i128::from(record.input_size) - i128::from(record.output_size);
+                }
                 progress.0.store(done, Ordering::Relaxed);
                 progress.1.store(saved as i64, Ordering::Relaxed);
                 let _ = events.send(Event::FileResult {
-                    path: record.path,
+                    path: journal::display_path(&record.path, record.member.as_deref()),
                     outcome: record.outcome,
                     done,
                     total,
@@ -219,6 +318,125 @@ pub async fn run_job_with_force(
             }
         }
     }
+    // Rebuild only after all member work has finished successfully.
+    if first_error.is_none() && !cancel.is_cancelled() {
+        let current = journal
+            .lock()
+            .map_err(|_| io::Error::other("journal lock poisoned"))?
+            .records()?;
+        let latest = journal::make_manifest(plan.clone(), &current, false);
+        for (index, entry) in plan
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e.action, Action::Rebuild { .. }))
+        {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let all_members_resumed = plan
+                .entries
+                .iter()
+                .filter(|member| member.path == entry.path && member.member.is_some())
+                .all(|member| {
+                    completed.contains_key(&(member.path.clone(), member.member.clone()))
+                });
+            if let Some(record) = completed
+                .get(&(entry.path.clone(), None))
+                .filter(|_| all_members_resumed)
+            {
+                done += 1;
+                saved += i128::from(record.input_size) - i128::from(record.output_size);
+                let _ = events.send(Event::FileResult {
+                    path: entry.path.clone(),
+                    outcome: record.outcome.clone(),
+                    done,
+                    total,
+                    bytes_saved: saved,
+                });
+                continue;
+            }
+            let _ = events.send(Event::FileStart {
+                path: entry.path.clone(),
+                done,
+                total,
+                bytes_saved: saved,
+            });
+            let mut replacements = BTreeMap::new();
+            for (member_index, member) in plan
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.path == entry.path && m.member.is_some())
+            {
+                if latest.entries.iter().any(|record| {
+                    record.path == member.path
+                        && record.member == member.member
+                        && record.outcome.starts_with("converted")
+                }) {
+                    replacements.insert(
+                        member.member.clone().unwrap(),
+                        metadata.join("members").join(member_index.to_string()),
+                    );
+                }
+            }
+            let temporary = metadata.join("tmp").join(format!("{index}.pack"));
+            let source = plan.input_root.0.join(&entry.path.0);
+            let destination = output.join(&entry.path.0);
+            ensure_output_parent(&output, &entry.path.0)?;
+            let (outcome, failure) = if replacements.is_empty() {
+                copy::stage_copy_entry(&plan.input_root.0, &output, &entry.path.0, &temporary)?;
+                ("no member converted".to_string(), false)
+            } else {
+                match pack_dirs[&entry.path]
+                    .0
+                    .rebuild(&source, &temporary, &replacements)
+                {
+                    Ok(()) => ("rebuilt".to_string(), false),
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&temporary);
+                        copy::stage_copy_entry(
+                            &plan.input_root.0,
+                            &output,
+                            &entry.path.0,
+                            &temporary,
+                        )?;
+                        (format!("rebuild failed: {error}"), true)
+                    }
+                }
+            };
+            if cancel.is_cancelled() {
+                let _ = std::fs::remove_file(&temporary);
+                break;
+            }
+            std::fs::rename(&temporary, &destination)?;
+            let (size, hash) = hash_input(&destination)?;
+            let record = JournalEntry {
+                path: entry.path.clone(),
+                member: None,
+                plan_hash: plan_hash.clone(),
+                input_hash: entry.hash.clone(),
+                output_hash: Some(hash),
+                input_size: entry.size,
+                output_size: size,
+                outcome: outcome.clone(),
+                failure,
+            };
+            journal
+                .lock()
+                .map_err(|_| io::Error::other("journal lock poisoned"))?
+                .append(&record)?;
+            done += 1;
+            saved += i128::from(record.input_size) - i128::from(record.output_size);
+            let _ = events.send(Event::FileResult {
+                path: entry.path.clone(),
+                outcome,
+                done,
+                total,
+                bytes_saved: saved,
+            });
+        }
+    }
     let journal = journal
         .lock()
         .map_err(|_| io::Error::other("journal lock poisoned"))?;
@@ -227,6 +445,13 @@ pub async fn run_job_with_force(
     }
     let records = journal.records()?;
     let complete = first_error.is_none() && !cancel.is_cancelled();
+    if complete {
+        // Every pack is rebuilt or restored, so staged member data is no longer needed.
+        match std::fs::remove_dir_all(metadata.join("members")) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
     let mut manifest = journal::make_manifest(plan.clone(), &records, complete);
     manifest.tool_versions = tools;
     let report = journal::build_report(&manifest);
@@ -371,6 +596,295 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
     }
+    struct FakePack {
+        fail: bool,
+    }
+    impl crate::registry::PackFormat for FakePack {
+        fn read_directory(&self, _: &Path) -> io::Result<Vec<crate::registry::PackMember>> {
+            Ok(vec![crate::registry::PackMember {
+                name: "member".into(),
+                offset: 0,
+                size: 20,
+            }])
+        }
+        fn read_member(&self, _: &Path, _: &crate::registry::PackMember) -> io::Result<Vec<u8>> {
+            Ok(b"a long member source".to_vec())
+        }
+        fn rebuild(
+            &self,
+            _: &Path,
+            output: &Path,
+            replacements: &BTreeMap<String, std::path::PathBuf>,
+        ) -> io::Result<()> {
+            if self.fail {
+                return Err(io::Error::other("fake rebuild failure"));
+            }
+            std::fs::copy(&replacements["member"], output)?;
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn packs_rebuild_or_preserve_original() -> io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let input = tmp.path().join("input");
+        std::fs::create_dir(&input)?;
+        std::fs::write(input.join("game.pck"), b"original pack bytes")?;
+        let (size, hash) = hash_input(&input.join("game.pck"))?;
+        let member_bytes = b"a long member source";
+        let settings = crate::ResolvedSettings::default();
+        let path = StoredPath("game.pck".into());
+        let plan = Plan {
+            plan_version: 3,
+            input_root: StoredPath(input.canonicalize()?),
+            engine: EngineInfo {
+                name: "fake".into(),
+                version: None,
+                excluded_paths: vec![],
+                notes: vec![],
+                version_check_overridden: false,
+            },
+            settings: settings.clone(),
+            tools: vec![],
+            entries: vec![
+                crate::Entry {
+                    path: path.clone(),
+                    member: None,
+                    size,
+                    hash,
+                    action: Action::Rebuild {
+                        format: "fake".into(),
+                    },
+                },
+                crate::Entry {
+                    path,
+                    member: Some("member".into()),
+                    size: member_bytes.len() as u64,
+                    hash: blake3::hash(member_bytes).to_hex().to_string(),
+                    action: Action::Convert {
+                        kind: MediaKind::Image,
+                        target: "fake".into(),
+                        encoder: "fake".into(),
+                        settings: crate::ConvertSettings::Image(settings.image()),
+                    },
+                },
+            ],
+        };
+        for (mode, encode_fail, rebuild_fail) in [
+            ("ok", false, false),
+            ("empty", true, false),
+            ("fail", false, true),
+        ] {
+            let mut transforms = TransformerRegistry::default();
+            transforms.register(
+                "fake",
+                Arc::new(Fake {
+                    fail: encode_fail,
+                    wait: false,
+                }),
+            );
+            let mut packs = crate::registry::PackRegistry::default();
+            packs.register("fake", Arc::new(FakePack { fail: rebuild_fail }));
+            let (sender, mut receiver) = broadcast::channel(100);
+            let out = tmp.path().join(mode);
+            let report = run_job_with_packs(
+                &plan,
+                &out,
+                &transforms,
+                &packs,
+                1,
+                CancellationToken::new(),
+                CancellationToken::new(),
+                sender,
+            )
+            .await?;
+            let result = std::fs::read(out.join("game.pck"))?;
+            if mode == "ok" {
+                assert_eq!(result, b"tiny");
+                assert_eq!(report.input_bytes, b"original pack bytes".len() as u64);
+                assert_eq!(report.output_bytes, 4);
+                assert_eq!(
+                    report.savings_by_media["image"],
+                    member_bytes.len() as i128 - 4
+                );
+                let mut names = Vec::new();
+                while let Ok(event) = receiver.try_recv() {
+                    if let Event::FileResult { path, .. } = event {
+                        names.push(path.0);
+                    }
+                }
+                assert_eq!(names.len(), 2);
+                assert!(names.contains(&std::path::PathBuf::from("game.pck::member")));
+                assert!(names.contains(&std::path::PathBuf::from("game.pck")));
+            } else {
+                assert_eq!(result, b"original pack bytes");
+            }
+            assert_eq!(
+                report.failures.len(),
+                usize::from(encode_fail || rebuild_fail)
+            );
+        }
+        Ok(())
+    }
+    struct CountingTransformer(Arc<std::sync::atomic::AtomicUsize>);
+    impl Transformer for CountingTransformer {
+        fn kind(&self) -> MediaKind {
+            MediaKind::Image
+        }
+        fn required_tools(&self) -> Vec<ToolSpec> {
+            vec![]
+        }
+        fn transform<'a>(
+            &'a self,
+            _: &'a Path,
+            dest: &'a Path,
+            _: &'a crate::ConvertSettings,
+            _: &'a CancellationToken,
+        ) -> Operation<'a, Option<String>> {
+            Box::pin(async move {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                tokio::fs::write(dest, b"tiny").await?;
+                Ok(None)
+            })
+        }
+        fn validate<'a>(
+            &'a self,
+            _: &'a Path,
+            _: &'a Path,
+            _: &'a crate::ConvertSettings,
+            _: &'a CancellationToken,
+        ) -> Operation<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_before_rebuild_resumes_staged_member() -> io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let input = tmp.path().join("input");
+        std::fs::create_dir(&input)?;
+        std::fs::write(input.join("game.pck"), b"original pack bytes")?;
+        std::fs::write(input.join("slow"), b"slow file content")?;
+        let (size, hash) = hash_input(&input.join("game.pck"))?;
+        let (slow_size, slow_hash) = hash_input(&input.join("slow"))?;
+        let member_bytes = b"a long member source";
+        let settings = crate::ResolvedSettings::default();
+        let pack = StoredPath("game.pck".into());
+        let convert = |encoder: &str| Action::Convert {
+            kind: MediaKind::Image,
+            target: "fake".into(),
+            encoder: encoder.into(),
+            settings: crate::ConvertSettings::Image(settings.image()),
+        };
+        let plan = Plan {
+            plan_version: 3,
+            input_root: StoredPath(input.canonicalize()?),
+            engine: EngineInfo {
+                name: "fake".into(),
+                version: None,
+                excluded_paths: vec![],
+                notes: vec![],
+                version_check_overridden: false,
+            },
+            settings: settings.clone(),
+            tools: vec![],
+            entries: vec![
+                crate::Entry {
+                    path: pack.clone(),
+                    member: None,
+                    size,
+                    hash,
+                    action: Action::Rebuild {
+                        format: "fake".into(),
+                    },
+                },
+                crate::Entry {
+                    path: pack,
+                    member: Some("member".into()),
+                    size: member_bytes.len() as u64,
+                    hash: blake3::hash(member_bytes).to_hex().to_string(),
+                    action: convert("count"),
+                },
+                crate::Entry {
+                    path: StoredPath("slow".into()),
+                    member: None,
+                    size: slow_size,
+                    hash: slow_hash,
+                    action: convert("slow"),
+                },
+            ],
+        };
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut transforms = TransformerRegistry::default();
+        transforms.register("count", Arc::new(CountingTransformer(count.clone())));
+        transforms.register(
+            "slow",
+            Arc::new(Fake {
+                fail: false,
+                wait: true,
+            }),
+        );
+        let mut packs = crate::registry::PackRegistry::default();
+        packs.register("fake", Arc::new(FakePack { fail: false }));
+        let token = CancellationToken::new();
+        let (sender, mut receiver) = broadcast::channel(100);
+        let trigger = token.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = receiver.recv().await {
+                if matches!(event, Event::FileResult { .. }) {
+                    trigger.cancel();
+                    break;
+                }
+            }
+        });
+        let out = tmp.path().join("out");
+        assert_eq!(
+            run_job_with_packs(
+                &plan,
+                &out,
+                &transforms,
+                &packs,
+                1,
+                token,
+                CancellationToken::new(),
+                sender
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(!out.join("game.pck").exists());
+        let (sender, _) = broadcast::channel(100);
+        run_job_with_packs(
+            &plan,
+            &out,
+            &transforms,
+            &packs,
+            1,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            sender,
+        )
+        .await?;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(out.join("game.pck"))?, b"tiny");
+        assert!(!out.join(".compressor/members").exists());
+        // A finished job resumes from the rebuilt pack without staged members.
+        let (sender, _) = broadcast::channel(100);
+        run_job_with_packs(
+            &plan,
+            &out,
+            &transforms,
+            &packs,
+            1,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            sender,
+        )
+        .await?;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(out.join("game.pck"))?, b"tiny");
+        Ok(())
+    }
     fn snapshot(root: &Path) -> io::Result<BTreeMap<std::path::PathBuf, (String, u32, i64, i64)>> {
         let mut result = BTreeMap::new();
         for entry in walkdir::WalkDir::new(root).follow_links(false) {
@@ -395,10 +909,13 @@ mod tests {
         let dir = tempfile::tempdir()?;
         for mode in ["success", "failure", "cancel"] {
             let mut registry = TransformerRegistry::default();
-            registry.register(Arc::new(Fake {
-                fail: mode == "failure",
-                wait: mode == "cancel",
-            }));
+            registry.register(
+                "fake",
+                Arc::new(Fake {
+                    fail: mode == "failure",
+                    wait: mode == "cancel",
+                }),
+            );
             let engine = EngineInfo {
                 name: "fake".into(),
                 version: None,

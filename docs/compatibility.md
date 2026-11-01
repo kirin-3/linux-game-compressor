@@ -71,3 +71,22 @@ conversions saved 59,171,172 bytes. The run reported no failures, and all
 3,212 files passed `compressor verify` (exit 0).
 The user played the converted build and confirmed that music, sound effects,
 and a looping track played correctly.
+
+# Godot 4
+
+Standalone PCK files and unsigned Windows executables containing embedded PCK
+packs are supported for Godot 4 pack formats 2–4. Encrypted directories,
+sparse bundles, Godot 3 and unknown formats, signed executables, and embedded
+packs in non-PE executables are copied unchanged. Encrypted members are kept.
+
+Single-image PNG and lossless WebP `.ctex` textures at or above
+`engines.godot.min_texture_kib` (default 4 KiB) can be converted to lossy WebP.
+Mipmaps, raw and VRAM-compressed textures, and unsupported texture types are
+left unchanged. Lossy WebP is re-encoded only when `image.reencode_webp` is
+true.
+
+`AudioStreamOggVorbis` and `AudioStreamMP3` binary resources can be re-encoded
+when their bitrate exceeds the profile target. Loop and beat properties are
+preserved. WAV and compressed binary resources are copied unchanged. MP3
+encoder delay and padding can shift loop points; sample-exact MP3 loops are
+not guaranteed.

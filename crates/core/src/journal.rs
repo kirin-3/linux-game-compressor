@@ -10,6 +10,7 @@ use std::{
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JournalEntry {
     pub path: StoredPath,
+    pub member: Option<String>,
     pub plan_hash: String,
     pub input_hash: String,
     pub output_hash: Option<String>,
@@ -17,6 +18,15 @@ pub struct JournalEntry {
     pub output_size: u64,
     pub outcome: String,
     pub failure: bool,
+}
+
+pub fn display_path(path: &StoredPath, member: Option<&str>) -> StoredPath {
+    let mut name = path.0.as_os_str().to_os_string();
+    if let Some(member) = member {
+        name.push("::");
+        name.push(member);
+    }
+    StoredPath(name.into())
 }
 
 pub struct Journal {
@@ -69,17 +79,17 @@ pub fn fingerprint(plan: &Plan) -> String {
 
 /// Keep the last synced completion for each path and reconstruct a manifest.
 pub fn make_manifest(plan: Plan, records: &[JournalEntry], complete: bool) -> Manifest {
-    let mut latest: HashMap<StoredPath, JournalEntry> = HashMap::new();
+    let mut latest: HashMap<(StoredPath, Option<String>), JournalEntry> = HashMap::new();
     let plan_hash = fingerprint(&plan);
     for record in records {
         if record.plan_hash == plan_hash {
-            latest.insert(record.path.clone(), record.clone());
+            latest.insert((record.path.clone(), record.member.clone()), record.clone());
         }
     }
     let entries = plan
         .entries
         .iter()
-        .filter_map(|entry| latest.remove(&entry.path))
+        .filter_map(|entry| latest.remove(&(entry.path.clone(), entry.member.clone())))
         .collect();
     Manifest {
         plan,
@@ -95,27 +105,57 @@ pub fn resumable_records(
     plan: &Plan,
     records: &[JournalEntry],
     output: &Path,
-) -> HashMap<StoredPath, JournalEntry> {
+) -> HashMap<(StoredPath, Option<String>), JournalEntry> {
     let expected: HashMap<_, _> = plan
         .entries
         .iter()
-        .map(|entry| (entry.path.clone(), &entry.hash))
+        .map(|entry| ((entry.path.clone(), entry.member.clone()), &entry.hash))
         .collect();
     let mut latest = HashMap::new();
     let plan_hash = fingerprint(plan);
     for record in records {
-        if record.plan_hash == plan_hash && expected.contains_key(&record.path) {
-            latest.insert(record.path.clone(), record.clone());
+        if record.plan_hash == plan_hash
+            && expected.contains_key(&(record.path.clone(), record.member.clone()))
+        {
+            latest.insert((record.path.clone(), record.member.clone()), record.clone());
         }
     }
-    latest.retain(|path, record| {
-        if expected.get(path).copied() != Some(&record.input_hash) {
+    // Staged members are removed once their pack is rebuilt; the rebuilt
+    // pack's recorded hash then vouches for them.
+    let rebuilt_packs: Vec<StoredPath> = latest
+        .iter()
+        .filter(|((path, member), record)| {
+            member.is_none()
+                && record.outcome == "rebuilt"
+                && expected.get(&(path.clone(), None)).copied() == Some(&record.input_hash)
+                && record.output_hash.as_ref().is_some_and(|hash| {
+                    hash_input(&output.join(&path.0)).is_ok_and(|(_, actual)| &actual == hash)
+                })
+        })
+        .map(|((path, _), _)| path.clone())
+        .collect();
+    latest.retain(|key, record| {
+        if expected.get(key).copied() != Some(&record.input_hash) {
             return false;
         }
+        if key.1.is_some() && !record.outcome.starts_with("converted") {
+            return record.output_hash.as_ref() == Some(&record.input_hash);
+        }
+        if key.1.is_some() && rebuilt_packs.contains(&key.0) {
+            return true;
+        }
         match &record.output_hash {
-            Some(hash) => {
-                hash_input(&output.join(&path.0)).is_ok_and(|(_, actual)| &actual == hash)
-            }
+            Some(hash) => hash_input(&if key.1.is_some() {
+                let index = plan
+                    .entries
+                    .iter()
+                    .position(|entry| entry.path == key.0 && entry.member == key.1)
+                    .expect("record belongs to plan");
+                output.join(".compressor/members").join(index.to_string())
+            } else {
+                output.join(&key.0 .0)
+            })
+            .is_ok_and(|(_, actual)| &actual == hash),
             None => false,
         }
     });
@@ -136,6 +176,7 @@ mod tests {
         let (_, hash) = hash_input(&output.join(&path.0))?;
         let mut record = JournalEntry {
             path: path.clone(),
+            member: None,
             plan_hash: String::new(),
             input_hash: "input".into(),
             output_hash: Some(hash),
@@ -145,7 +186,7 @@ mod tests {
             failure: false,
         };
         let plan = Plan {
-            plan_version: 2,
+            plan_version: 3,
             input_root: StoredPath(temp.path().to_owned()),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -158,6 +199,7 @@ mod tests {
             tools: vec![],
             entries: vec![Entry {
                 path: path.clone(),
+                member: None,
                 size: 9,
                 hash: "input".into(),
                 action: Action::Copy {
@@ -181,9 +223,68 @@ mod tests {
             make_manifest(plan.clone(), &records, false).entries.len(),
             1
         );
-        assert!(resumable_records(&plan, &records, &output).contains_key(&path));
+        assert!(resumable_records(&plan, &records, &output).contains_key(&(path.clone(), None)));
         fs::write(output.join(&path.0), b"modified")?;
-        assert!(!resumable_records(&plan, &records, &output).contains_key(&path));
+        assert!(!resumable_records(&plan, &records, &output).contains_key(&(path.clone(), None)));
+        Ok(())
+    }
+    #[test]
+    fn resume_distinguishes_members_of_one_pack() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let output = temp.path();
+        fs::create_dir_all(output.join(".compressor/members"))?;
+        let path = StoredPath("game.pck".into());
+        let entries: Vec<_> = ["a", "b"]
+            .iter()
+            .map(|name| Entry {
+                path: path.clone(),
+                member: Some((*name).into()),
+                size: 5,
+                hash: format!("input-{name}"),
+                action: Action::Copy {
+                    reason: "test".into(),
+                },
+            })
+            .collect();
+        let plan = Plan {
+            plan_version: 3,
+            input_root: StoredPath(output.to_owned()),
+            engine: EngineInfo {
+                name: "fake".into(),
+                version: None,
+                excluded_paths: vec![],
+                notes: vec![],
+                version_check_overridden: false,
+            },
+            settings: ResolvedSettings::default(),
+            tools: vec![],
+            entries,
+        };
+        let mut records = Vec::new();
+        for (index, entry) in plan.entries.iter().enumerate() {
+            let staged = output.join(".compressor/members").join(index.to_string());
+            fs::write(&staged, format!("result-{index}"))?;
+            records.push(JournalEntry {
+                path: path.clone(),
+                member: entry.member.clone(),
+                plan_hash: fingerprint(&plan),
+                input_hash: entry.hash.clone(),
+                output_hash: Some(hash_input(&staged)?.1),
+                input_size: 5,
+                output_size: 8,
+                outcome: "converted".into(),
+                failure: false,
+            });
+        }
+        assert_eq!(
+            make_manifest(plan.clone(), &records, false).entries.len(),
+            2
+        );
+        assert_eq!(resumable_records(&plan, &records, output).len(), 2);
+        fs::write(output.join(".compressor/members/0"), b"tampered")?;
+        let resumed = resumable_records(&plan, &records, output);
+        assert_eq!(resumed.len(), 1);
+        assert!(resumed.contains_key(&(path, Some("b".into()))));
         Ok(())
     }
     #[test]
@@ -236,31 +337,46 @@ pub fn build_report(manifest: &Manifest) -> Report {
     let completed: Vec<_> = manifest
         .entries
         .iter()
-        .map(|entry| entry.path.clone())
+        .map(|entry| display_path(&entry.path, entry.member.as_deref()))
         .collect();
     let pending = manifest
         .plan
         .entries
         .iter()
-        .filter(|entry| !completed.contains(&entry.path))
-        .map(|entry| entry.path.clone())
+        .filter(|entry| {
+            !manifest
+                .entries
+                .iter()
+                .any(|record| record.path == entry.path && record.member == entry.member)
+        })
+        .map(|entry| display_path(&entry.path, entry.member.as_deref()))
         .collect();
     let mut savings_by_media = BTreeMap::new();
     let mut skips = Vec::new();
     let mut failures = Vec::new();
     for record in &manifest.entries {
+        let mut display_record = record.clone();
+        display_record.path = display_path(&record.path, record.member.as_deref());
         if record.failure {
-            failures.push(record.clone());
-        } else if !record.outcome.starts_with("converted") {
-            skips.push(record.clone());
+            failures.push(display_record);
+        } else if !record.outcome.starts_with("converted") && record.outcome != "rebuilt" {
+            skips.push(display_record);
         }
         if let Some(entry) = manifest
             .plan
             .entries
             .iter()
-            .find(|entry| entry.path == record.path)
+            .find(|entry| entry.path == record.path && entry.member == record.member)
         {
+            let pack_failed = record.member.is_some()
+                && manifest
+                    .entries
+                    .iter()
+                    .any(|pack| pack.path == record.path && pack.member.is_none() && pack.failure);
             if let crate::Action::Convert { kind, .. } = &entry.action {
+                if pack_failed {
+                    continue;
+                }
                 *savings_by_media
                     .entry(format!("{kind:?}").to_lowercase())
                     .or_insert(0) += i128::from(record.input_size) - i128::from(record.output_size);
@@ -276,8 +392,18 @@ pub fn build_report(manifest: &Manifest) -> Report {
         notes,
         completed,
         pending,
-        input_bytes: manifest.entries.iter().map(|e| e.input_size).sum(),
-        output_bytes: manifest.entries.iter().map(|e| e.output_size).sum(),
+        input_bytes: manifest
+            .entries
+            .iter()
+            .filter(|e| e.member.is_none())
+            .map(|e| e.input_size)
+            .sum(),
+        output_bytes: manifest
+            .entries
+            .iter()
+            .filter(|e| e.member.is_none())
+            .map(|e| e.output_size)
+            .sum(),
         savings_by_media,
         skips,
         failures,

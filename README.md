@@ -1,9 +1,9 @@
-# Ren'Py media compressor
+# Game media compressor
 
-A Linux command-line tool for copying a Ren'Py game to a separate directory
-while replacing eligible loose PNG and JPEG images with smaller, validated
-WebP images and eligible Ogg/MP3 audio with smaller, validated audio. Archives
-are copied unchanged; their contents are not processed.
+A Linux command-line tool for copying a Ren'Py or Godot 4 game to a separate
+directory while converting eligible images and audio to smaller, validated
+formats. Ren'Py archives are copied unchanged; Godot PCK packs are rebuilt
+when eligible members convert.
 
 ## Install
 
@@ -53,6 +53,9 @@ opus_kbps_per_channel = 48
 vorbis_quality = 3
 mp3_kbps_per_channel = 64
 
+[engines.godot]
+min_texture_kib = 4
+
 [engines.renpy]
 ogg_target = "vorbis"
 
@@ -69,6 +72,17 @@ Converted files retain their original names and extensions. Images contain
 WebP bytes; Ogg audio defaults to Opus unless `ogg_target` selects Vorbis,
 and MP3 remains MP3. Tools that assume extensions match content may not
 recognize converted files. WAV and FLAC are copied unchanged.
+
+For a Godot 4 export, use the same `inspect`, `plan`, `compress`, and `verify`
+commands. Pack members are shown as `pack.pck::member`. Set the minimum
+texture size with `--set engines.godot.min_texture_kib=4` (KiB; default 4).
+For example, `compressor plan "$GAME" --set engines.godot.min_texture_kib=4 --list`
+shows the affected members. See [compatibility](docs/compatibility.md#godot-4)
+for supported packs and resources.
+
+Allow enough disk space for the complete output, staged converted members,
+and a temporary rebuilt pack. Staged members are kept in `.compressor/` for
+resume and verification.
 
 The output's `.compressor/` directory stores the plan, journal, manifest,
 report, and temporary working files. Keep it to resume an interrupted job

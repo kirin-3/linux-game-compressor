@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use compressor_core::{
-    job::{run_job_with_force, Event},
+    job::{run_job_with_packs, Event},
     planning::{build_plan, hash_input, validate_plan},
-    registry::{EngineAdapter, EngineRegistry, TransformerRegistry},
+    registry::{EngineRegistry, PackRegistry, TransformerRegistry},
     Action, Plan,
 };
 use compressor_engine_renpy::RenpyAdapter;
@@ -80,8 +80,16 @@ enum Commands {
 }
 fn registry() -> TransformerRegistry {
     let mut r = TransformerRegistry::default();
-    r.register(Arc::new(WebpTransformer));
-    r.register(Arc::new(AudioTransformer));
+    r.register("cwebp", Arc::new(WebpTransformer));
+    r.register("ffmpeg", Arc::new(AudioTransformer));
+    r.register(
+        "godot-ctex",
+        Arc::new(compressor_engine_godot::texture_transform::GodotTextureTransformer),
+    );
+    r.register(
+        "godot-audio",
+        Arc::new(compressor_engine_godot::audio_transform::GodotAudioTransformer),
+    );
     r
 }
 fn engine_registry(allow: bool) -> EngineRegistry {
@@ -89,7 +97,16 @@ fn engine_registry(allow: bool) -> EngineRegistry {
     engines.register(Arc::new(RenpyAdapter {
         allow_unknown_version: allow,
     }));
+    engines.register(Arc::new(compressor_engine_godot::adapter::GodotAdapter));
     engines
+}
+fn pack_registry() -> PackRegistry {
+    let mut packs = PackRegistry::default();
+    packs.register(
+        "godot-pck",
+        Arc::new(compressor_engine_godot::GodotPackFormat),
+    );
+    packs
 }
 fn engine_specs(engines: &EngineRegistry) -> BTreeMap<String, Vec<compressor_core::OptionSpec>> {
     engines
@@ -104,16 +121,13 @@ fn engine_specs(engines: &EngineRegistry) -> BTreeMap<String, Vec<compressor_cor
         .collect()
 }
 fn new_plan(game: &Path, profile: Option<&str>, set: &[String], allow: bool) -> io::Result<Plan> {
-    let adapter = RenpyAdapter {
-        allow_unknown_version: allow,
-    };
-    let engine = adapter.detect(game)?.ok_or_else(|| {
+    let engines = engine_registry(allow);
+    let (adapter, engine) = engines.detect(game)?.ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "no supported engine detected")
     })?;
-    let engines = engine_registry(allow);
     let specs = engine_specs(&engines);
     let settings = compressor_core::settings::resolve(profile, set, adapter.id(), &specs)?;
-    build_plan(game, &adapter, engine, settings, &registry())
+    build_plan(game, adapter.as_ref(), engine, settings, &registry())
 }
 fn print_json<T: serde::Serialize>(value: &T) -> io::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
@@ -126,16 +140,81 @@ fn plan_counts(plan: &Plan) -> BTreeMap<String, usize> {
             Action::Convert { .. } => "convert".to_owned(),
             Action::Copy { reason } => format!("copy: {reason}"),
             Action::Skip { reason } => format!("skip: {reason}"),
+            Action::Rebuild { format } => format!("rebuild: {format}"),
         };
         *counts.entry(key).or_insert(0) += 1;
     }
     counts
 }
 #[derive(serde::Serialize)]
+struct PackInfo {
+    file: compressor_core::StoredPath,
+    location: String,
+    format: u32,
+    version: String,
+    encrypted: bool,
+    members: BTreeMap<String, MediaCount>,
+    note: Option<String>,
+}
+fn inspect_packs(root: &Path) -> io::Result<Vec<PackInfo>> {
+    let mut result = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(Some((start, len))) = compressor_engine_godot::locate_trailer(&path) else {
+            continue;
+        };
+        let Ok(header) = compressor_engine_godot::read_header(&path, start) else {
+            continue;
+        };
+        let encrypted = header.flags & 1 != 0;
+        let mut members = BTreeMap::<String, MediaCount>::new();
+        let pack = compressor_engine_godot::read_pack(&path, start, len);
+        let note = pack
+            .as_ref()
+            .err()
+            .map(|e| format!("{}; copied unchanged", e));
+        if let Ok(pack) = pack {
+            for member in pack.members {
+                let lower = member.path.to_ascii_lowercase();
+                let kind = if lower.ends_with(".ctex") {
+                    "texture"
+                } else if lower.ends_with(".oggvorbisstr") {
+                    "ogg_vorbis"
+                } else if lower.ends_with(".mp3str") {
+                    "mp3"
+                } else {
+                    "other"
+                };
+                let count = members
+                    .entry(kind.into())
+                    .or_insert(MediaCount { count: 0, bytes: 0 });
+                count.count += 1;
+                count.bytes += member.size;
+            }
+        }
+        result.push(PackInfo {
+            file: compressor_core::StoredPath(entry.file_name().into()),
+            location: if start == 0 { "standalone" } else { "embedded" }.into(),
+            format: header.format,
+            version: format!("{}.{}.{}", header.major, header.minor, header.patch),
+            encrypted,
+            members,
+            note,
+        });
+    }
+    result.sort_by(|a, b| a.file.0.cmp(&b.file.0));
+    Ok(result)
+}
+#[derive(serde::Serialize)]
 struct InspectResult {
     engine: compressor_core::EngineInfo,
     media: BTreeMap<String, MediaCount>,
     archives: Vec<(String, u64)>,
+    packs: Vec<PackInfo>,
     tools: Vec<(String, bool, BTreeMap<String, bool>)>,
     blockers: Vec<String>,
 }
@@ -144,6 +223,9 @@ fn inspect(game: &Path) -> io::Result<InspectResult> {
     let mut media = BTreeMap::<String, MediaCount>::new();
     let mut archives = Vec::new();
     for entry in &plan.entries {
+        if entry.member.is_some() {
+            continue;
+        }
         let path = plan.input_root.0.join(&entry.path.0);
         if !std::fs::symlink_metadata(&path)?.is_file() {
             continue;
@@ -200,6 +282,7 @@ fn inspect(game: &Path) -> io::Result<InspectResult> {
         engine: plan.engine,
         media,
         archives,
+        packs: inspect_packs(game)?,
         tools,
         blockers,
     })
@@ -302,6 +385,26 @@ async fn run(cli: Cli) -> io::Result<i32> {
                 for (name, size) in result.archives {
                     println!("archive: {name} ({size} bytes)");
                 }
+                for pack in result.packs {
+                    println!(
+                        "pack: {} ({}, format {}, Godot {}, {})",
+                        pack.file.0.display(),
+                        pack.location,
+                        pack.format,
+                        pack.version,
+                        if pack.encrypted {
+                            "encrypted"
+                        } else {
+                            "unencrypted"
+                        }
+                    );
+                    for (kind, count) in pack.members {
+                        println!("  {kind}: {} members, {} bytes", count.count, count.bytes);
+                    }
+                    if let Some(note) = pack.note {
+                        println!("  {note}");
+                    }
+                }
                 for (name, available, features) in result.tools {
                     println!(
                         "{name}: {}",
@@ -338,10 +441,30 @@ async fn run(cli: Cli) -> io::Result<i32> {
                 for (kind, count) in plan_counts(&plan) {
                     println!("{kind}: {count}");
                 }
+                println!(
+                    "packs rebuilt: {}",
+                    plan.entries
+                        .iter()
+                        .filter(|e| matches!(e.action, Action::Rebuild { .. }))
+                        .count()
+                );
                 let mut by_media = BTreeMap::<String, usize>::new();
                 for entry in &plan.entries {
                     let media = match &entry.action {
                         Action::Convert { kind, .. } => format!("{kind:?}").to_lowercase(),
+                        _ if entry.member.is_some() => {
+                            let name = entry.member.as_deref().unwrap_or("").to_ascii_lowercase();
+                            if name.ends_with(".ctex") {
+                                "image".into()
+                            } else if [".oggvorbisstr", ".mp3str", ".sample"]
+                                .iter()
+                                .any(|suffix| name.ends_with(suffix))
+                            {
+                                "audio".into()
+                            } else {
+                                "other".into()
+                            }
+                        }
                         _ => {
                             let path = plan.input_root.0.join(&entry.path.0);
                             if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
@@ -363,6 +486,7 @@ async fn run(cli: Cli) -> io::Result<i32> {
                         Action::Convert { .. } => "convert".to_owned(),
                         Action::Copy { reason } => format!("copy: {reason}"),
                         Action::Skip { reason } => format!("skip: {reason}"),
+                        Action::Rebuild { format } => format!("rebuild: {format}"),
                     };
                     *by_media.entry(format!("{media} {action}")).or_default() += 1;
                 }
@@ -371,7 +495,13 @@ async fn run(cli: Cli) -> io::Result<i32> {
                 }
                 if list {
                     for e in &plan.entries {
-                        println!("{}: {:?}", e.path.0.display(), e.action);
+                        println!(
+                            "{}: {:?}",
+                            compressor_core::journal::display_path(&e.path, e.member.as_deref())
+                                .0
+                                .display(),
+                            e.action
+                        );
                     }
                 }
             }
@@ -480,8 +610,17 @@ async fn run(cli: Cli) -> io::Result<i32> {
                     force_signal.cancel();
                 }
             });
-            let result =
-                run_job_with_force(&plan, &output, &registry(), jobs, token, force, sender).await;
+            let result = run_job_with_packs(
+                &plan,
+                &output,
+                &registry(),
+                &pack_registry(),
+                jobs,
+                token,
+                force,
+                sender,
+            )
+            .await;
             signal.abort();
             let _ = progress.await;
             let report = result?;
@@ -525,23 +664,120 @@ async fn verify(output: &Path) -> io::Result<VerifyResult> {
         result.errors.push("manifest marks job incomplete".into());
     }
     for entry in &manifest.plan.entries {
-        if !manifest
-            .entries
-            .iter()
-            .any(|record| record.path == entry.path && record.input_hash == entry.hash)
-        {
+        if !manifest.entries.iter().any(|record| {
+            record.path == entry.path
+                && record.member == entry.member
+                && record.input_hash == entry.hash
+        }) {
             result.errors.push(format!(
                 "{}: missing manifest record",
-                entry.path.0.display()
+                compressor_core::journal::display_path(&entry.path, entry.member.as_deref())
+                    .0
+                    .display()
             ));
         }
     }
+    let mut directories = std::collections::HashMap::new();
     for entry in &manifest.entries {
         let Some(hash) = &entry.output_hash else {
             continue;
         };
         result.checked += 1;
         let path = output.join(&entry.path.0);
+        if let Some(member_name) = &entry.member {
+            if !entry.outcome.starts_with("converted") {
+                result.checked -= 1;
+                continue;
+            }
+            let name = compressor_core::journal::display_path(&entry.path, Some(member_name));
+            let pack_record = manifest
+                .entries
+                .iter()
+                .find(|r| r.path == entry.path && r.member.is_none());
+            if pack_record.is_some_and(|r| r.failure) {
+                continue;
+            }
+            let format = manifest.plan.entries.iter().find_map(|p| {
+                if p.path == entry.path && p.member.is_none() {
+                    if let Action::Rebuild { format } = &p.action {
+                        Some(format.as_str())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            });
+            let Some(handler) = format.and_then(|format| pack_registry().get(format)) else {
+                result
+                    .errors
+                    .push(format!("{}: missing pack format", name.0.display()));
+                continue;
+            };
+            if !directories.contains_key(&entry.path) {
+                match handler.read_directory(&path) {
+                    Ok(directory) => {
+                        directories.insert(entry.path.clone(), directory);
+                    }
+                    Err(error) => {
+                        result.errors.push(format!("{}: {error}", name.0.display()));
+                        continue;
+                    }
+                }
+            }
+            let bytes = directories[&entry.path]
+                .iter()
+                .find(|m| &m.name == member_name)
+                .ok_or_else(|| io::Error::other("member missing"))
+                .and_then(|member| handler.read_member(&path, member));
+            let bytes = match bytes {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    result.errors.push(format!("{}: {e}", name.0.display()));
+                    continue;
+                }
+            };
+            if blake3::hash(&bytes).to_hex().as_str() != hash {
+                result
+                    .errors
+                    .push(format!("{}: hash mismatch", name.0.display()));
+                continue;
+            }
+            if entry.outcome.starts_with("converted") {
+                let planned = manifest
+                    .plan
+                    .entries
+                    .iter()
+                    .find(|p| p.path == entry.path && p.member == entry.member);
+                let checked = match planned.map(|p| &p.action) {
+                    Some(Action::Convert {
+                        encoder, settings, ..
+                    }) => {
+                        match registry().get(encoder) {
+                            Some(transformer) => {
+                                let file = tempfile::NamedTempFile::new()?;
+                                std::fs::write(file.path(), bytes)?;
+                                // A matching hash identifies the bytes already checked against their source at conversion time.
+                                transformer
+                                    .validate(
+                                        file.path(),
+                                        file.path(),
+                                        settings,
+                                        &CancellationToken::new(),
+                                    )
+                                    .await
+                            }
+                            None => Err(io::Error::other("missing transformer")),
+                        }
+                    }
+                    _ => Err(io::Error::other("missing conversion settings")),
+                };
+                if let Err(e) = checked {
+                    result.errors.push(format!("{}: {e}", name.0.display()));
+                }
+            }
+            continue;
+        }
         match hash_input(&path) {
             Ok((_, actual)) if &actual == hash => {}
             _ => {

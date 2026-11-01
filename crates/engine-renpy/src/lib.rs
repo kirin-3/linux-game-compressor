@@ -491,10 +491,14 @@ mod tests {
             &std::collections::BTreeMap::from([("renpy".into(), adapter.options())]),
         )?;
         let mut registry = compressor_core::registry::TransformerRegistry::default();
-        registry.register(std::sync::Arc::new(compressor_media::webp::WebpTransformer));
-        registry.register(std::sync::Arc::new(
-            compressor_media::audio::AudioTransformer,
-        ));
+        registry.register(
+            "cwebp",
+            std::sync::Arc::new(compressor_media::webp::WebpTransformer),
+        );
+        registry.register(
+            "ffmpeg",
+            std::sync::Arc::new(compressor_media::audio::AudioTransformer),
+        );
         for version in [None, Some("6.99.8".to_owned())] {
             engine.version = version;
             let ogg_action =
@@ -757,7 +761,7 @@ mod tests {
             &output.path().join(".compressor/journal.jsonl"),
         )?;
         let plan = compressor_core::Plan {
-            plan_version: 2,
+            plan_version: 3,
             input_root: StoredPath(root.to_owned()),
             engine: engine.clone(),
             settings: ResolvedSettings::default(),

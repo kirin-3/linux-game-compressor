@@ -225,6 +225,9 @@ pub struct ToolSpec {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
+    Rebuild {
+        format: String,
+    },
     Convert {
         kind: MediaKind,
         target: String,
@@ -242,6 +245,7 @@ pub enum Action {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
     pub path: StoredPath,
+    pub member: Option<String>,
     pub size: u64,
     pub hash: String,
     pub action: Action,
@@ -369,7 +373,7 @@ mod tests {
             PathBuf::from(OsString::from_vec(b"game/invalid-\xff.png".to_vec())),
         ];
         let plan = Plan {
-            plan_version: 2,
+            plan_version: 3,
             input_root: StoredPath("/tmp/game".into()),
             engine: EngineInfo {
                 name: "Ren'Py".into(),
@@ -387,6 +391,7 @@ mod tests {
             entries: vec![
                 Entry {
                     path: StoredPath(paths[0].clone()),
+                    member: None,
                     size: 12,
                     hash: "abc".into(),
                     action: Action::Convert {
@@ -398,6 +403,7 @@ mod tests {
                 },
                 Entry {
                     path: StoredPath(paths[1].clone()),
+                    member: None,
                     size: 7,
                     hash: "def".into(),
                     action: Action::Skip {
@@ -406,10 +412,11 @@ mod tests {
                 },
                 Entry {
                     path: StoredPath("Game.sh".into()),
+                    member: Some("member.png".into()),
                     size: 3,
                     hash: "ghi".into(),
-                    action: Action::Copy {
-                        reason: "launcher".into(),
+                    action: Action::Rebuild {
+                        format: "test-pack".into(),
                     },
                 },
             ],

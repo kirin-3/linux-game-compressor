@@ -418,7 +418,7 @@ mod tests {
         assert!(std::fs::metadata(&converted)?.len() >= std::fs::metadata(&source)?.len());
         let (size, hash) = compressor_core::planning::hash_input(&source)?;
         let plan = Plan {
-            plan_version: 2,
+            plan_version: 3,
             input_root: StoredPath(source_dir.canonicalize()?),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -431,6 +431,7 @@ mod tests {
             tools: WebpTransformer.required_tools(),
             entries: vec![Entry {
                 path: StoredPath("sprite.png".into()),
+                member: None,
                 size,
                 hash,
                 action: Action::Convert {
@@ -442,7 +443,7 @@ mod tests {
             }],
         };
         let mut registry = TransformerRegistry::default();
-        registry.register(Arc::new(WebpTransformer));
+        registry.register("cwebp", Arc::new(WebpTransformer));
         let full_out = dir.path().join("full-job");
         let (events, _) = tokio::sync::broadcast::channel(16);
         let report = compressor_core::job::run_job(

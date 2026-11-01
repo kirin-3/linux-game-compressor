@@ -175,6 +175,8 @@ impl Transformer for AudioTransformer {
                 "-map".into(),
                 "0:a:0".into(),
                 "-vn".into(),
+                "-af".into(),
+                "asetpts=N/SR/TB".into(),
                 "-map_metadata".into(),
                 match info.container {
                     Container::Ogg => "0:s:a:0",
@@ -294,8 +296,16 @@ fn unsupported() -> io::Error {
 }
 
 pub fn sniff(path: &Path) -> io::Result<AudioInfo> {
-    let mut file = File::open(path)?;
-    let size = file.metadata()?.len();
+    sniff_reader(&mut File::open(path)?)
+}
+
+pub fn sniff_bytes(bytes: &[u8]) -> io::Result<AudioInfo> {
+    sniff_reader(&mut io::Cursor::new(bytes))
+}
+
+fn sniff_reader<R: Read + Seek>(file: &mut R) -> io::Result<AudioInfo> {
+    let size = file.seek(SeekFrom::End(0))?;
+    file.seek(SeekFrom::Start(0))?;
     let mut magic = [0; 4];
     file.read_exact(&mut magic).map_err(|e| {
         if e.kind() == io::ErrorKind::UnexpectedEof {
@@ -306,9 +316,9 @@ pub fn sniff(path: &Path) -> io::Result<AudioInfo> {
     })?;
     file.seek(SeekFrom::Start(0))?;
     if &magic == b"OggS" {
-        sniff_ogg(&mut file, size)
+        sniff_ogg(file, size)
     } else {
-        sniff_mp3(&mut file, size)
+        sniff_mp3(file, size)
     }
 }
 
@@ -408,7 +418,7 @@ fn frame_chain(window: &[u8], start: usize, remaining: u64) -> bool {
     true
 }
 
-fn sniff_mp3(file: &mut File, size: u64) -> io::Result<AudioInfo> {
+fn sniff_mp3<R: Read + Seek>(file: &mut R, size: u64) -> io::Result<AudioInfo> {
     let mut offset = 0u64;
     let mut picture = false;
     if size >= 10 {
@@ -557,7 +567,7 @@ fn sniff_mp3(file: &mut File, size: u64) -> io::Result<AudioInfo> {
     })
 }
 
-fn sniff_ogg(file: &mut File, size: u64) -> io::Result<AudioInfo> {
+fn sniff_ogg<R: Read + Seek>(file: &mut R, size: u64) -> io::Result<AudioInfo> {
     let mut identification = Vec::new();
     let mut packet = 0u8;
     let mut comment_tail = Vec::new();
@@ -1016,6 +1026,7 @@ mod tests {
                 .status()?;
             assert!(status.success());
             let info = sniff(&path)?;
+            assert_eq!(sniff_bytes(&std::fs::read(&path)?)?, info);
             assert_eq!(info.codec, Codec::Mp3);
             assert_eq!(info.channels, 2);
             assert_eq!(info.sample_rate, 44100);

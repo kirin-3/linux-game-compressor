@@ -1,11 +1,26 @@
 use crate::{
-    Action, ConvertSettings, EngineInfo, Manifest, MediaKind, OptionSpec, ResolvedSettings,
-    ToolSpec,
+    Action, ConvertSettings, EngineInfo, MediaKind, OptionSpec, ResolvedSettings, ToolSpec,
 };
-use std::{future::Future, io, path::Path, pin::Pin, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    future::Future,
+    io,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+};
 use tokio_util::sync::CancellationToken;
 
 pub type Operation<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
+
+/// A member and its planned action within an expandable pack.
+#[derive(Clone, Debug)]
+pub struct MemberPlan {
+    pub member: String,
+    pub size: u64,
+    pub hash: String,
+    pub action: Action,
+}
 
 /// Engine-specific detection and decisions; paths passed to `classify` are relative.
 pub trait EngineAdapter: Send + Sync {
@@ -21,6 +36,16 @@ pub trait EngineAdapter: Send + Sync {
         engine: &EngineInfo,
         settings: &ResolvedSettings,
     ) -> io::Result<Action>;
+    /// Supported packs are classified as `Rebuild` with their format before expansion.
+    fn expand(
+        &self,
+        _root: &Path,
+        _path: &Path,
+        _engine: &EngineInfo,
+        _settings: &ResolvedSettings,
+    ) -> io::Result<Option<Vec<MemberPlan>>> {
+        Ok(None)
+    }
     fn plan_notes(
         &self,
         _root: &Path,
@@ -29,9 +54,6 @@ pub trait EngineAdapter: Send + Sync {
         _entries: &[crate::Entry],
     ) -> Vec<String> {
         Vec::new()
-    }
-    fn package(&self, _output: &Path, _manifest: &Manifest) -> io::Result<()> {
-        Ok(())
     }
 }
 
@@ -78,6 +100,36 @@ pub trait Transformer: Send + Sync {
     }
 }
 
+/// An opaque directory entry identifying a member in a pack.
+#[derive(Clone, Debug)]
+pub struct PackMember {
+    pub name: String,
+    pub offset: u64,
+    pub size: u64,
+}
+
+pub trait PackFormat: Send + Sync {
+    fn read_directory(&self, input: &Path) -> io::Result<Vec<PackMember>>;
+    fn read_member(&self, input: &Path, member: &PackMember) -> io::Result<Vec<u8>>;
+    fn rebuild(
+        &self,
+        input: &Path,
+        output: &Path,
+        replacements: &BTreeMap<String, PathBuf>,
+    ) -> io::Result<()>;
+}
+
+#[derive(Default)]
+pub struct PackRegistry(HashMap<String, Arc<dyn PackFormat>>);
+impl PackRegistry {
+    pub fn register(&mut self, format: &str, handler: Arc<dyn PackFormat>) {
+        self.0.insert(format.to_owned(), handler);
+    }
+    pub fn get(&self, format: &str) -> Option<Arc<dyn PackFormat>> {
+        self.0.get(format).cloned()
+    }
+}
+
 #[derive(Default)]
 pub struct EngineRegistry(Vec<Arc<dyn EngineAdapter>>);
 impl EngineRegistry {
@@ -101,13 +153,13 @@ impl EngineRegistry {
 }
 
 #[derive(Default)]
-pub struct TransformerRegistry(Vec<Arc<dyn Transformer>>);
+pub struct TransformerRegistry(std::collections::HashMap<String, Arc<dyn Transformer>>);
 impl TransformerRegistry {
-    pub fn register(&mut self, transformer: Arc<dyn Transformer>) {
-        self.0.push(transformer);
+    pub fn register(&mut self, encoder: &str, transformer: Arc<dyn Transformer>) {
+        self.0.insert(encoder.to_owned(), transformer);
     }
-    pub fn get(&self, kind: &MediaKind) -> Option<Arc<dyn Transformer>> {
-        self.0.iter().find(|t| &t.kind() == kind).cloned()
+    pub fn get(&self, encoder: &str) -> Option<Arc<dyn Transformer>> {
+        self.0.get(encoder).cloned()
     }
 }
 
@@ -188,13 +240,9 @@ mod tests {
             Action::Copy { .. }
         ));
         let mut transformers = TransformerRegistry::default();
-        transformers.register(Arc::new(Encoder));
+        transformers.register("fake", Arc::new(Encoder));
         assert_eq!(
-            transformers
-                .get(&MediaKind::Image)
-                .unwrap()
-                .required_tools()[0]
-                .name,
+            transformers.get("fake").unwrap().required_tools()[0].name,
             "fake"
         );
     }

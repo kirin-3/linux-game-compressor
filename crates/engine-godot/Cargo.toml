@@ -1,0 +1,20 @@
+[package]
+name = "compressor-engine-godot"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+compressor-core.workspace = true
+compressor-media.workspace = true
+serde_json.workspace = true
+md-5 = "0.10"
+blake3.workspace = true
+tempfile.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+compressor-test-fixtures = { path = "../test-fixtures" }
+tokio.workspace = true
+image.workspace = true

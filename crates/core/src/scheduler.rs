@@ -232,6 +232,7 @@ mod tests {
             let (size, hash) = crate::planning::hash_input(&input.join(&name))?;
             entries.push(Entry {
                 path: StoredPath(name.into()),
+                member: None,
                 size,
                 hash,
                 action: Action::Convert {
@@ -245,7 +246,7 @@ mod tests {
             });
         }
         Ok(Plan {
-            plan_version: 2,
+            plan_version: 3,
             input_root: StoredPath(input),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -284,7 +285,7 @@ mod tests {
         let plan = convert_plan(&dir.path().join("input"), 5, b"source is long enough")?;
         let fake = fake();
         let mut registry = TransformerRegistry::default();
-        registry.register(fake.clone());
+        registry.register("fake", fake.clone());
         let cancel = CancellationToken::new();
         let stopper = cancel.clone();
         let journal_path = output.join(".compressor/journal.jsonl");
@@ -336,7 +337,7 @@ mod tests {
         let output = dir.path().join("output");
         let plan = convert_plan(&dir.path().join("input"), 2, b"source is long enough")?;
         let mut registry = TransformerRegistry::default();
-        registry.register(fake());
+        registry.register("fake", fake());
         run(&plan, &output, &registry, 1, CancellationToken::new()).await?;
         // A killed process leaves plan.json and the journal but no manifest.
         std::fs::remove_file(output.join(".compressor/manifest.json"))?;
@@ -359,7 +360,7 @@ mod tests {
         )?;
         let fake = fake();
         let mut registry = TransformerRegistry::default();
-        registry.register(fake.clone());
+        registry.register("fake", fake.clone());
         run(&plan, &output, &registry, 2, CancellationToken::new()).await?;
         assert_eq!(fake.max.load(Ordering::SeqCst), 2);
         for i in 0..6 {

@@ -17,7 +17,7 @@ fn incompatible_plans_and_manifests_do_not_change_output() -> io::Result<()> {
     let tmp = tempfile::tempdir()?;
     let plan = tmp.path().join("old-plan.json");
     let out = tmp.path().join("output");
-    std::fs::write(&plan, br#"{"plan_version":1}"#)?;
+    std::fs::write(&plan, br#"{"plan_version":2}"#)?;
     let args = [
         "compress",
         str_path(fixture.root()),
@@ -32,7 +32,7 @@ fn incompatible_plans_and_manifests_do_not_change_output() -> io::Result<()> {
     assert!(!out.exists());
     std::fs::create_dir_all(out.join(".compressor"))?;
     let manifest = out.join(".compressor/manifest.json");
-    let old = br#"{"plan":{"plan_version":1}}"#;
+    let old = br#"{"plan":{"plan_version":2}}"#;
     std::fs::write(&manifest, old)?;
     std::fs::write(out.join("keep"), b"unchanged")?;
     let result = command(&[
@@ -658,5 +658,148 @@ fn documented_usage_commands_run() -> io::Result<()> {
             String::from_utf8_lossy(&result.stderr)
         );
     }
+    Ok(())
+}
+
+#[test]
+fn godot_plan_lists_pack_members() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut header = [0; 36];
+    header[..4].copy_from_slice(b"GST2");
+    let texture = compressor_engine_godot::ctex::Texture {
+        header,
+        data_format: 1,
+        width: 16,
+        height: 16,
+        mipmaps: 0,
+        image_format: 5,
+        images: vec![vec![42; 5000]],
+    }
+    .write()?;
+    let pack = compressor_test_fixtures::godot_pack_members(&[
+        ("asset.ctex", &texture),
+        ("scene.gdc", b"script"),
+    ]);
+    std::fs::write(dir.path().join("game.pck"), pack)?;
+    let result = command(&["plan", str_path(dir.path()), "--list"])?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let documented = command(&[
+        "plan",
+        str_path(dir.path()),
+        "--set",
+        "engines.godot.min_texture_kib=4",
+        "--list",
+    ])?;
+    assert!(
+        documented.status.success(),
+        "{}",
+        String::from_utf8_lossy(&documented.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("game.pck::asset.ctex"));
+    assert!(stdout.contains("game.pck::scene.gdc"));
+    assert!(stdout.contains("Rebuild"));
+    assert!(stdout.contains("packs rebuilt: 1"));
+    assert!(stdout.contains("image convert: 1"));
+    Ok(())
+}
+#[test]
+fn inspect_reports_godot_pack_and_encryption() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pack = dir.path().join("game.pck");
+    std::fs::write(
+        &pack,
+        compressor_test_fixtures::godot_pack_members(&[
+            ("texture.ctex", b"texture"),
+            ("music.mp3str", b"audio"),
+            ("scene.gdc", b"script"),
+        ]),
+    )?;
+    let result = command(&["inspect", str_path(dir.path()), "--json"])?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+    assert_eq!(json["engine"]["version"], "4.7.0");
+    assert_eq!(json["packs"][0]["location"], "standalone");
+    assert_eq!(json["packs"][0]["format"], 4);
+    assert_eq!(json["packs"][0]["members"]["texture"]["count"], 1);
+    std::fs::write(&pack, compressor_test_fixtures::godot_pack(4, 1))?;
+    let result = command(&["inspect", str_path(dir.path()), "--json"])?;
+    assert!(result.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+    assert_eq!(json["packs"][0]["encrypted"], true);
+    assert!(json["packs"][0]["note"]
+        .as_str()
+        .unwrap()
+        .contains("copied unchanged"));
+    Ok(())
+}
+#[test]
+fn verifies_godot_member_and_reports_tampering() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let game = dir.path().join("game");
+    let output = dir.path().join("output");
+    std::fs::create_dir(&game)?;
+    let png = dir.path().join("image.png");
+    let mut img = image::RgbaImage::new(128, 128);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        *p = image::Rgba([
+            (x * 2) as u8,
+            (y * 2) as u8,
+            ((x * y) % 256) as u8,
+            if x < 20 { 0 } else { 255 },
+        ]);
+    }
+    img.save(&png).map_err(io::Error::other)?;
+    let mut header = [0; 36];
+    header[..4].copy_from_slice(b"GST2");
+    let texture = compressor_engine_godot::ctex::Texture {
+        header,
+        data_format: 1,
+        width: 128,
+        height: 128,
+        mipmaps: 0,
+        image_format: 5,
+        images: vec![std::fs::read(png)?],
+    }
+    .write()?;
+    std::fs::write(
+        game.join("game.pck"),
+        compressor_test_fixtures::godot_pack_members(&[("texture.ctex", &texture)]),
+    )?;
+    let result = command(&["compress", str_path(&game), "--output", str_path(&output)])?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let result = command(&["verify", str_path(&output)])?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let replacement = dir.path().join("bad");
+    std::fs::write(&replacement, b"altered")?;
+    let pack = output.join("game.pck");
+    let changed = dir.path().join("changed");
+    compressor_engine_godot::rebuild_pack(
+        &pack,
+        &changed,
+        &std::collections::BTreeMap::from([("texture.ctex".into(), replacement)]),
+    )?;
+    std::fs::rename(changed, pack)?;
+    let result = command(&["verify", str_path(&output)])?;
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("game.pck::texture.ctex: hash mismatch")
+    );
     Ok(())
 }
