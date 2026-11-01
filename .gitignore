@@ -1,0 +1,5 @@
+openspec/
+.agents/
+.claude/
+example_games/
+target/

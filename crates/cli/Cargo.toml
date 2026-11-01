@@ -1,0 +1,27 @@
+[package]
+name = "compressor-cli"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "compressor"
+path = "src/main.rs"
+
+[dependencies]
+compressor-core.workspace = true
+compressor-media.workspace = true
+compressor-engine-renpy.workspace = true
+clap.workspace = true
+indicatif.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+compressor-test-fixtures = { path = "../test-fixtures" }
+tempfile.workspace = true
+libc.workspace = true

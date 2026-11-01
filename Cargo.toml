@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/media", "crates/engine-renpy", "crates/cli", "crates/test-fixtures"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.88"
+
+[workspace.dependencies]
+compressor-core = { path = "crates/core" }
+compressor-media = { path = "crates/media" }
+compressor-engine-renpy = { path = "crates/engine-renpy" }
+tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+tokio-util = "0.7"
+blake3 = "1"
+rayon = "1"
+walkdir = "2"
+toml = "0.8"
+tokio = { version = "1", features = ["process", "io-util", "fs", "time", "macros", "rt-multi-thread", "sync", "signal"] }
+libc = "0.2"
+reflink-copy = "0.1"
+filetime = "0.2"
+pathdiff = "0.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+regex = "1"
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.18"
