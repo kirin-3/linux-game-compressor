@@ -1,6 +1,6 @@
 use crate::{
     registry::{EngineAdapter, TransformerRegistry},
-    Action, EngineInfo, Entry, Plan, Profile, StoredPath, ToolSpec,
+    Action, EngineInfo, Entry, Plan, ResolvedSettings, StoredPath, ToolSpec,
 };
 use rayon::prelude::*;
 use std::{
@@ -10,6 +10,28 @@ use std::{
     path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
+
+const PLAN_VERSION: u64 = 2;
+
+fn versioned_json(path: &Path, manifest: bool) -> io::Result<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+    let plan = if manifest { &value["plan"] } else { &value };
+    if plan.get("plan_version").and_then(serde_json::Value::as_u64) != Some(PLAN_VERSION) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "written by an incompatible version; re-run plan",
+        ));
+    }
+    Ok(value)
+}
+
+pub fn read_plan(path: &Path) -> io::Result<Plan> {
+    serde_json::from_value(versioned_json(path, false)?).map_err(io::Error::from)
+}
+
+pub fn read_manifest(path: &Path) -> io::Result<crate::Manifest> {
+    serde_json::from_value(versioned_json(path, true)?).map_err(io::Error::from)
+}
 
 /// Hash the bytes of a file or the link text itself, never a symlink's target.
 pub fn hash_input(path: &Path) -> io::Result<(u64, String)> {
@@ -40,8 +62,8 @@ pub fn hash_input(path: &Path) -> io::Result<(u64, String)> {
 pub fn build_plan(
     root: &Path,
     adapter: &dyn EngineAdapter,
-    engine: EngineInfo,
-    profile: Profile,
+    mut engine: EngineInfo,
+    settings: ResolvedSettings,
     transformers: &TransformerRegistry,
 ) -> io::Result<Plan> {
     let root = root.canonicalize()?;
@@ -59,7 +81,7 @@ pub fn build_plan(
         .map(|path| {
             let relative = path.strip_prefix(&root).map_err(io::Error::other)?;
             let (size, hash) = hash_input(path)?;
-            let action = adapter.classify(&root, relative, &engine, &profile)?;
+            let action = adapter.classify(&root, relative, &engine, &settings)?;
             Ok(Entry {
                 path: StoredPath(relative.to_owned()),
                 size,
@@ -69,27 +91,35 @@ pub fn build_plan(
         })
         .collect::<io::Result<_>>()?;
     entries.sort_by(|a, b| a.path.0.cmp(&b.path.0));
+    let notes = adapter.plan_notes(&root, &engine, &settings, &entries);
+    engine.notes.extend(notes);
     let mut tools: Vec<ToolSpec> = Vec::new();
     for entry in &entries {
-        if let Action::Convert { kind, .. } = &entry.action {
+        if let Action::Convert { kind, settings, .. } = &entry.action {
             let transformer = transformers.get(kind).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     "no transformer registered for planned media",
                 )
             })?;
-            for tool in transformer.required_tools() {
-                if !tools.contains(&tool) {
+            for tool in transformer.required_tools_for(settings) {
+                if let Some(existing) = tools.iter_mut().find(|t| t.name == tool.name) {
+                    for feature in tool.features {
+                        if !existing.features.contains(&feature) {
+                            existing.features.push(feature);
+                        }
+                    }
+                } else {
                     tools.push(tool);
                 }
             }
         }
     }
     Ok(Plan {
-        plan_version: 1,
+        plan_version: 2,
         input_root: StoredPath(root),
         engine,
-        profile,
+        settings,
         tools,
         entries,
     })
@@ -97,6 +127,12 @@ pub fn build_plan(
 
 /// Reject plans if their input tree or any recorded content has changed.
 pub fn validate_plan(plan: &Plan, root: &Path) -> io::Result<()> {
+    if u64::from(plan.plan_version) != PLAN_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "written by an incompatible version; re-run plan",
+        ));
+    }
     let root = root.canonicalize()?;
     if root != plan.input_root.0 {
         return Err(io::Error::new(
@@ -145,10 +181,19 @@ mod tests {
     use compressor_test_fixtures::Fixture;
     struct Fake;
     impl EngineAdapter for Fake {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
         fn detect(&self, _: &Path) -> io::Result<Option<EngineInfo>> {
             unreachable!()
         }
-        fn classify(&self, _: &Path, _: &Path, _: &EngineInfo, _: &Profile) -> io::Result<Action> {
+        fn classify(
+            &self,
+            _: &Path,
+            _: &Path,
+            _: &EngineInfo,
+            _: &ResolvedSettings,
+        ) -> io::Result<Action> {
             Ok(Action::Copy {
                 reason: "fixture".into(),
             })
@@ -164,13 +209,7 @@ mod tests {
             notes: vec![],
             version_check_overridden: false,
         };
-        let profile = Profile {
-            name: "test".into(),
-            quality: 82,
-            effort: 4,
-            sharp_yuv: false,
-            reencode_webp: false,
-        };
+        let profile = ResolvedSettings::default();
         let plan = build_plan(
             fixture.root(),
             &Fake,
@@ -201,13 +240,7 @@ mod tests {
             notes: vec![],
             version_check_overridden: false,
         };
-        let profile = Profile {
-            name: "test".into(),
-            quality: 82,
-            effort: 4,
-            sharp_yuv: false,
-            reencode_webp: false,
-        };
+        let profile = ResolvedSettings::default();
         let plan = build_plan(
             fixture.root(),
             &Fake,

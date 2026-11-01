@@ -3,7 +3,7 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConversionOutcome {
-    Converted,
+    Converted { note: Option<String> },
     KeptOriginal { reason: String, failed: bool },
 }
 
@@ -12,7 +12,7 @@ pub(crate) async fn transform_one(
     source: PathBuf,
     destination: PathBuf,
     temporary: PathBuf,
-    profile: crate::Profile,
+    settings: crate::ConvertSettings,
     transformer: Arc<dyn crate::registry::Transformer>,
     cancel: &CancellationToken,
 ) -> io::Result<ConversionOutcome> {
@@ -20,7 +20,7 @@ pub(crate) async fn transform_one(
         source,
         destination,
         temporary,
-        profile,
+        settings,
         transformer,
         cancel,
         &CancellationToken::new(),
@@ -32,7 +32,7 @@ pub(crate) async fn transform_one_with_force(
     source: PathBuf,
     destination: PathBuf,
     temporary: PathBuf,
-    profile: crate::Profile,
+    settings: crate::ConvertSettings,
     transformer: Arc<dyn crate::registry::Transformer>,
     cancel: &CancellationToken,
     force: &CancellationToken,
@@ -41,9 +41,9 @@ pub(crate) async fn transform_one_with_force(
         return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
     }
     let encoded = transformer
-        .transform_with_force(&source, &temporary, &profile, cancel, force)
+        .transform_with_force(&source, &temporary, &settings, cancel, force)
         .await;
-    let outcome = if let Err(err) = encoded {
+    let outcome = if let Err(ref err) = encoded {
         ConversionOutcome::KeptOriginal {
             reason: format!("encoder failed: {err}"),
             failed: true,
@@ -54,7 +54,7 @@ pub(crate) async fn transform_one_with_force(
             failed: true,
         }
     } else if let Err(err) = transformer
-        .validate_with_force(&source, &temporary, cancel, force)
+        .validate_with_force(&source, &temporary, &settings, cancel, force)
         .await
     {
         ConversionOutcome::KeptOriginal {
@@ -69,7 +69,9 @@ pub(crate) async fn transform_one_with_force(
             failed: false,
         }
     } else {
-        ConversionOutcome::Converted
+        ConversionOutcome::Converted {
+            note: encoded.expect("encoding succeeded"),
+        }
     };
     if cancel.is_cancelled() {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
@@ -94,7 +96,8 @@ mod tests {
     use super::*;
     use crate::{
         registry::{Operation, Transformer, TransformerRegistry},
-        Action, EngineInfo, Entry, MediaKind, Plan, Profile, StoredPath, ToolSpec,
+        Action, ConvertSettings, EngineInfo, Entry, MediaKind, Plan, ResolvedSettings, StoredPath,
+        ToolSpec,
     };
     use std::{
         path::Path,
@@ -116,9 +119,9 @@ mod tests {
             &'a self,
             _src: &'a Path,
             out: &'a Path,
-            _: &'a Profile,
+            _: &'a ConvertSettings,
             _: &'a CancellationToken,
-        ) -> Operation<'a, ()> {
+        ) -> Operation<'a, Option<String>> {
             Box::pin(async move {
                 self.started.fetch_add(1, Ordering::SeqCst);
                 let n = self.active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -126,13 +129,14 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                 tokio::fs::write(out, b"encoded").await?;
                 self.active.fetch_sub(1, Ordering::SeqCst);
-                Ok(())
+                Ok(None)
             })
         }
         fn validate<'a>(
             &'a self,
             _: &'a Path,
             _: &'a Path,
+            _: &'a ConvertSettings,
             _: &'a CancellationToken,
         ) -> Operation<'a, ()> {
             Box::pin(async { Ok(()) })
@@ -152,9 +156,9 @@ mod tests {
             &'a self,
             _: &'a Path,
             out: &'a Path,
-            _: &'a Profile,
+            _: &'a ConvertSettings,
             _: &'a CancellationToken,
-        ) -> Operation<'a, ()> {
+        ) -> Operation<'a, Option<String>> {
             Box::pin(async move {
                 if self.mode == "encoder" {
                     return Err(io::Error::other("encoder error"));
@@ -164,13 +168,15 @@ mod tests {
                 } else {
                     b"ok".as_slice()
                 };
-                tokio::fs::write(out, data).await
+                tokio::fs::write(out, data).await?;
+                Ok(None)
             })
         }
         fn validate<'a>(
             &'a self,
             _: &'a Path,
             _: &'a Path,
+            _: &'a ConvertSettings,
             _: &'a CancellationToken,
         ) -> Operation<'a, ()> {
             Box::pin(async move {
@@ -194,7 +200,7 @@ mod tests {
                 source,
                 destination.clone(),
                 temporary,
-                Profile::default(),
+                ConvertSettings::Image(ResolvedSettings::default().image()),
                 Arc::new(FailingFake { mode }),
                 &CancellationToken::new(),
             )
@@ -219,7 +225,6 @@ mod tests {
     fn convert_plan(input: &Path, count: usize, content: &[u8]) -> io::Result<Plan> {
         std::fs::create_dir_all(input)?;
         let input = input.canonicalize()?;
-        let profile = Profile::default();
         let mut entries = Vec::new();
         for i in 0..count {
             let name = format!("{i}.png");
@@ -233,12 +238,14 @@ mod tests {
                     kind: MediaKind::Image,
                     target: "webp".into(),
                     encoder: "fake".into(),
-                    settings: profile.clone(),
+                    settings: crate::ConvertSettings::Image(
+                        crate::ResolvedSettings::default().image(),
+                    ),
                 },
             });
         }
         Ok(Plan {
-            plan_version: 1,
+            plan_version: 2,
             input_root: StoredPath(input),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -247,7 +254,7 @@ mod tests {
                 notes: vec![],
                 version_check_overridden: false,
             },
-            profile,
+            settings: crate::ResolvedSettings::default(),
             tools: vec![],
             entries,
         })

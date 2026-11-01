@@ -125,7 +125,7 @@ pub fn resumable_records(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Action, EngineInfo, Entry, Profile};
+    use crate::{Action, EngineInfo, Entry, ResolvedSettings};
     #[test]
     fn resumes_synced_records_and_redoes_tampered_output() -> io::Result<()> {
         let temp = tempfile::tempdir()?;
@@ -145,7 +145,7 @@ mod tests {
             failure: false,
         };
         let plan = Plan {
-            plan_version: 1,
+            plan_version: 2,
             input_root: StoredPath(temp.path().to_owned()),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -154,7 +154,7 @@ mod tests {
                 notes: vec![],
                 version_check_overridden: false,
             },
-            profile: Profile::default(),
+            settings: ResolvedSettings::default(),
             tools: vec![],
             entries: vec![Entry {
                 path: path.clone(),
@@ -166,6 +166,14 @@ mod tests {
             }],
         };
         record.plan_hash = fingerprint(&plan);
+        let mut changed_settings = plan.clone();
+        changed_settings
+            .settings
+            .values
+            .get_mut("audio.vorbis_quality")
+            .unwrap()
+            .value = serde_json::json!(4);
+        assert_ne!(fingerprint(&plan), fingerprint(&changed_settings));
         let mut journal = Journal::open(&output.join(".compressor/journal.jsonl"))?;
         journal.append(&record)?;
         let records = journal.records()?;

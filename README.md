@@ -1,14 +1,17 @@
-# Ren'Py image compressor
+# Ren'Py media compressor
 
 A Linux command-line tool for copying a Ren'Py game to a separate directory
 while replacing eligible loose PNG and JPEG images with smaller, validated
-WebP images. Archives are copied unchanged; their contents are not processed.
+WebP images and eligible Ogg/MP3 audio with smaller, validated audio. Archives
+are copied unchanged; their contents are not processed.
 
 ## Install
 
 Install the libwebp command-line tools (`cwebp`, `dwebp`, and `webpinfo`). On
 Arch Linux and CachyOS the package is `libwebp-utils`; on Debian and Ubuntu it
-is `webp`. Install Rust 1.88 or newer, then build with `cargo build --release`.
+is `webp`. Install `ffmpeg` and `ffprobe` from the `ffmpeg` package with the
+`libopus`, `libvorbis`, and `libmp3lame` encoders needed by your plan. Install
+Rust 1.88 or newer, then build with `cargo build --release`.
 The binary is `target/release/compressor`.
 
 ## Usage
@@ -19,8 +22,10 @@ and `PLAN` to a path for a saved plan. With `compressor` on your `PATH`:
 ```sh
 compressor inspect "$GAME"
 compressor inspect "$GAME" --json
+compressor settings --engine renpy --profile small --set image.quality=70
+compressor settings "$GAME" --json
 compressor plan "$GAME" --profile balanced --list
-compressor plan "$GAME" --profile small --save "$PLAN"
+compressor plan "$GAME" --profile small --set audio.vorbis_quality=2 --save "$PLAN"
 compressor compress "$GAME" --output "$OUTPUT" --plan "$PLAN" --jobs 2
 compressor verify "$OUTPUT"
 compressor verify "$OUTPUT" --json
@@ -29,13 +34,30 @@ compressor verify "$OUTPUT" --json
 `inspect` only reads the game; `plan` writes only the optional saved plan.
 `compress` also accepts `--profile balanced`, `quality`, or `small` instead
 of `--plan`, and `--allow-unknown-version` to override the engine version
-gate. A profile can be a TOML file, for example:
+gate. `plan` and `compress` accept repeatable `--set key=value` overrides;
+they cannot be combined with a saved `--plan`. Use `settings` to see effective
+values, their sources, and engine options. A profile can be a TOML file:
 
 ```toml
-quality = 90
+name = "custom"
+base = "quality"
+
+[image]
+quality = 88
 effort = 6
 sharp_yuv = true
 reencode_webp = false
+
+[audio]
+opus_kbps_per_channel = 48
+vorbis_quality = 3
+mp3_kbps_per_channel = 64
+
+[engines.renpy]
+ogg_target = "vorbis"
+
+[engines.renpy.image]
+quality = 78
 ```
 
 The default `balanced` profile uses quality 82 and effort 4. `quality` uses
@@ -43,9 +65,10 @@ The default `balanced` profile uses quality 82 and effort 4. `quality` uses
 under eligible filenames. Animated images, presplash images, and icons are
 not converted. Any failed or non-smaller conversion keeps the original.
 
-Converted files retain their original names and extensions, but contain WebP
-bytes. This keeps Ren'Py references intact; modding or translation tools
-that assume extensions match image contents may not recognize those files.
+Converted files retain their original names and extensions. Images contain
+WebP bytes; Ogg audio defaults to Opus unless `ogg_target` selects Vorbis,
+and MP3 remains MP3. Tools that assume extensions match content may not
+recognize converted files. WAV and FLAC are copied unchanged.
 
 The output's `.compressor/` directory stores the plan, journal, manifest,
 report, and temporary working files. Keep it to resume an interrupted job

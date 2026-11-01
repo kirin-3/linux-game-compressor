@@ -12,6 +12,343 @@ fn str_path(path: &Path) -> &str {
     path.to_str().unwrap()
 }
 #[test]
+fn incompatible_plans_and_manifests_do_not_change_output() -> io::Result<()> {
+    let fixture = compressor_test_fixtures::Fixture::new()?;
+    let tmp = tempfile::tempdir()?;
+    let plan = tmp.path().join("old-plan.json");
+    let out = tmp.path().join("output");
+    std::fs::write(&plan, br#"{"plan_version":1}"#)?;
+    let args = [
+        "compress",
+        str_path(fixture.root()),
+        "--output",
+        str_path(&out),
+        "--plan",
+        str_path(&plan),
+    ];
+    let result = command(&args)?;
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("incompatible version; re-run plan"));
+    assert!(!out.exists());
+    std::fs::create_dir_all(out.join(".compressor"))?;
+    let manifest = out.join(".compressor/manifest.json");
+    let old = br#"{"plan":{"plan_version":1}}"#;
+    std::fs::write(&manifest, old)?;
+    std::fs::write(out.join("keep"), b"unchanged")?;
+    let result = command(&[
+        "compress",
+        str_path(fixture.root()),
+        "--output",
+        str_path(&out),
+    ])?;
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("incompatible version; re-run plan"));
+    assert_eq!(std::fs::read(manifest)?, old);
+    assert_eq!(std::fs::read(out.join("keep"))?, b"unchanged");
+    assert_eq!(std::fs::read_dir(out.join(".compressor"))?.count(), 1);
+    Ok(())
+}
+#[test]
+fn plan_audio_overrides_and_saved_plan_conflict() -> io::Result<()> {
+    let fixture = compressor_test_fixtures::Fixture::new()?;
+    let path = fixture.root().join("game/music.ogg");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "anoisesrc=duration=2",
+            "-ac",
+            "2",
+            "-c:a",
+            "libvorbis",
+            "-q:a",
+            "8",
+            "-y",
+        ])
+        .arg(&path)
+        .status()?;
+    assert!(status.success());
+    let result = command(&[
+        "plan",
+        str_path(fixture.root()),
+        "--set",
+        "audio.vorbis_quality=2",
+        "--set",
+        "engines.renpy.ogg_target=vorbis",
+        "--json",
+    ])?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+    let entry = json["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "game/music.ogg")
+        .unwrap();
+    assert_eq!(entry["action"]["settings"]["audio"]["codec"], "vorbis");
+    assert_eq!(entry["action"]["settings"]["audio"]["vorbis_quality"], 2);
+    let dir = tempfile::tempdir()?;
+    let out = dir.path().join("output");
+    let result = command(&[
+        "compress",
+        str_path(fixture.root()),
+        "--output",
+        str_path(&out),
+        "--plan",
+        "plan.json",
+        "--set",
+        "image.quality=70",
+    ])?;
+    assert_eq!(result.status.code(), Some(2));
+    assert!(!out.exists());
+    Ok(())
+}
+#[test]
+fn cancellation_stops_running_ffmpeg_and_removes_stage() -> io::Result<()> {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
+    let fixture = compressor_test_fixtures::Fixture::new()?;
+    let audio = fixture.root().join("game/music.ogg");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "anoisesrc=duration=10",
+            "-ac",
+            "2",
+            "-c:a",
+            "libvorbis",
+            "-q:a",
+            "8",
+            "-y",
+        ])
+        .arg(audio)
+        .status()?;
+    assert!(status.success());
+    let dir = tempfile::tempdir()?;
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin)?;
+    let wrapper = bin.join("ffmpeg");
+    std::fs::write(&wrapper, "#!/bin/sh\nif [ \"$1\" = -nostdin ]; then echo $$ > \"$AUDIO_TEST_PID\"; exec /usr/bin/ffmpeg -re \"$@\"; fi\nexec /usr/bin/ffmpeg \"$@\"\n")?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+    let pids = dir.path().join("pid");
+    let output = dir.path().join("out");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_compressor"))
+        .args([
+            "compress",
+            str_path(fixture.root()),
+            "--output",
+            str_path(&output),
+            "--jobs",
+            "1",
+        ])
+        .env("PATH", path)
+        .env("AUDIO_TEST_PID", &pids)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let until = Instant::now() + Duration::from_secs(20);
+    while !pids.exists() && Instant::now() < until {
+        if let Some(status) = child.try_wait()? {
+            panic!("compressor exited before encoding: {status}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(pids.exists(), "ffmpeg did not start");
+    let pid: i32 = std::fs::read_to_string(&pids)?.trim().parse().unwrap();
+    assert!(Path::new(&format!("/proc/{pid}")).exists());
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+    }
+    let status = child.wait()?;
+    assert_eq!(status.code(), Some(130));
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "ffmpeg survived cancellation"
+    );
+    assert_eq!(
+        std::fs::read_dir(output.join(".compressor/tmp"))?.count(),
+        0
+    );
+    Ok(())
+}
+#[test]
+fn settings_command_reports_sources_and_rejects_invalid_values() -> io::Result<()> {
+    let result = command(&[
+        "settings",
+        "--engine",
+        "renpy",
+        "--profile",
+        "small",
+        "--set",
+        "image.quality=70",
+    ])?;
+    assert!(result.status.success());
+    let output = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        output.contains("image.quality = 70 (source: --set)"),
+        "{output}"
+    );
+    assert!(
+        output.contains(
+            "engines.renpy.ogg_target = opus (source: engine default; allowed: opus, vorbis)"
+        ),
+        "{output}"
+    );
+    assert!(
+        output.contains("audio.vorbis_quality = 1 (source: profile small)"),
+        "{output}"
+    );
+    let fixture = compressor_test_fixtures::Fixture::new()?;
+    let result = command(&["settings", str_path(fixture.root()), "--json"])?;
+    assert!(result.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+    assert_eq!(json["engine"], "renpy");
+    assert_eq!(json["settings"]["values"]["image.quality"]["value"], 82);
+    let result = command(&[
+        "settings",
+        "--engine",
+        "renpy",
+        "--set",
+        "image.quality=150",
+    ])?;
+    assert_eq!(result.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("image.quality: must be an integer between 0 and 100"));
+    Ok(())
+}
+#[test]
+fn inspect_and_plan_report_audio_and_tools() -> io::Result<()> {
+    let fixture = compressor_test_fixtures::Fixture::new()?;
+    let path = fixture.root().join("game/music.ogg");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "anoisesrc=duration=2",
+            "-ac",
+            "2",
+            "-c:a",
+            "libvorbis",
+            "-q:a",
+            "8",
+            "-y",
+        ])
+        .arg(&path)
+        .status()?;
+    assert!(status.success());
+    let result = command(&["inspect", str_path(fixture.root()), "--json"])?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+    assert_eq!(json["media"]["vorbis"]["count"], 1);
+    assert_eq!(
+        json["media"]["vorbis"]["bytes"],
+        std::fs::metadata(path)?.len()
+    );
+    let tools = json["tools"].as_array().unwrap();
+    let ffmpeg = tools.iter().find(|v| v[0] == "ffmpeg").unwrap();
+    assert_eq!(ffmpeg[1], true);
+    assert_eq!(ffmpeg[2]["libopus"], true);
+    assert!(tools.iter().any(|v| v[0] == "ffprobe"));
+    let plan = command(&["plan", str_path(fixture.root())])?;
+    assert!(String::from_utf8_lossy(&plan.stdout).contains("audio convert: 1"));
+    Ok(())
+}
+#[test]
+fn verifies_mixed_output_and_detects_modified_audio() -> io::Result<()> {
+    let fixture = compressor_test_fixtures::Fixture::new()?;
+    let audio = fixture.root().join("game/music.ogg");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "anoisesrc=duration=2",
+            "-ac",
+            "2",
+            "-c:a",
+            "libvorbis",
+            "-q:a",
+            "8",
+            "-y",
+        ])
+        .arg(audio)
+        .status()?;
+    assert!(status.success());
+    let dir = tempfile::tempdir()?;
+    let output = dir.path().join("out");
+    let result = command(&[
+        "compress",
+        str_path(fixture.root()),
+        "--output",
+        str_path(&output),
+    ])?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join(".compressor/manifest.json"))?)?;
+    let record = manifest["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "game/music.ogg")
+        .unwrap();
+    assert!(
+        record["outcome"].as_str().unwrap().starts_with("converted"),
+        "{record}"
+    );
+    let result = command(&["verify", str_path(&output)])?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    std::fs::write(output.join("game/music.ogg"), b"changed")?;
+    let result = command(&["verify", str_path(&output)])?;
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("game/music.ogg: hash mismatch"));
+    Ok(())
+}
+#[test]
 fn inspect_plan_compress_verify_and_reject_conflicts() -> io::Result<()> {
     let fixture = compressor_test_fixtures::Fixture::new()?;
     let game = str_path(fixture.root());

@@ -10,8 +10,8 @@ compressor-core.workspace = true
 compressor-media.workspace = true
 walkdir.workspace = true
 regex.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 compressor-test-fixtures = { path = "../test-fixtures" }
 tempfile.workspace = true

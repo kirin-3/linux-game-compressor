@@ -2,12 +2,11 @@ use clap::{Parser, Subcommand};
 use compressor_core::{
     job::{run_job_with_force, Event},
     planning::{build_plan, hash_input, validate_plan},
-    profile::load_profile,
-    registry::{EngineAdapter, TransformerRegistry},
+    registry::{EngineAdapter, EngineRegistry, TransformerRegistry},
     Action, Plan,
 };
 use compressor_engine_renpy::RenpyAdapter;
-use compressor_media::{detect, webp::WebpTransformer};
+use compressor_media::{audio::AudioTransformer, webp::WebpTransformer, MediaCount};
 use std::{
     collections::BTreeMap,
     io::{self, IsTerminal},
@@ -28,6 +27,18 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
+    Settings {
+        #[arg(conflicts_with = "engine")]
+        game: Option<PathBuf>,
+        #[arg(long)]
+        engine: Option<String>,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        set: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
     Inspect {
         game: PathBuf,
         #[arg(long)]
@@ -37,6 +48,8 @@ enum Commands {
         game: PathBuf,
         #[arg(long)]
         profile: Option<String>,
+        #[arg(long)]
+        set: Vec<String>,
         #[arg(long)]
         list: bool,
         #[arg(long)]
@@ -50,6 +63,8 @@ enum Commands {
         output: PathBuf,
         #[arg(long, conflicts_with = "plan")]
         profile: Option<String>,
+        #[arg(long, conflicts_with = "plan")]
+        set: Vec<String>,
         #[arg(long)]
         plan: Option<PathBuf>,
         #[arg(long, default_value_t=std::thread::available_parallelism().map_or(1,usize::from))]
@@ -66,16 +81,39 @@ enum Commands {
 fn registry() -> TransformerRegistry {
     let mut r = TransformerRegistry::default();
     r.register(Arc::new(WebpTransformer));
+    r.register(Arc::new(AudioTransformer));
     r
 }
-fn new_plan(game: &Path, profile: Option<&str>, allow: bool) -> io::Result<Plan> {
+fn engine_registry(allow: bool) -> EngineRegistry {
+    let mut engines = EngineRegistry::default();
+    engines.register(Arc::new(RenpyAdapter {
+        allow_unknown_version: allow,
+    }));
+    engines
+}
+fn engine_specs(engines: &EngineRegistry) -> BTreeMap<String, Vec<compressor_core::OptionSpec>> {
+    engines
+        .ids()
+        .into_iter()
+        .map(|id| {
+            (
+                id.to_owned(),
+                engines.by_id(id).expect("registered engine").options(),
+            )
+        })
+        .collect()
+}
+fn new_plan(game: &Path, profile: Option<&str>, set: &[String], allow: bool) -> io::Result<Plan> {
     let adapter = RenpyAdapter {
         allow_unknown_version: allow,
     };
     let engine = adapter.detect(game)?.ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "no supported engine detected")
     })?;
-    build_plan(game, &adapter, engine, load_profile(profile)?, &registry())
+    let engines = engine_registry(allow);
+    let specs = engine_specs(&engines);
+    let settings = compressor_core::settings::resolve(profile, set, adapter.id(), &specs)?;
+    build_plan(game, &adapter, engine, settings, &registry())
 }
 fn print_json<T: serde::Serialize>(value: &T) -> io::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
@@ -94,20 +132,15 @@ fn plan_counts(plan: &Plan) -> BTreeMap<String, usize> {
     counts
 }
 #[derive(serde::Serialize)]
-struct MediaCount {
-    count: u64,
-    bytes: u64,
-}
-#[derive(serde::Serialize)]
 struct InspectResult {
     engine: compressor_core::EngineInfo,
     media: BTreeMap<String, MediaCount>,
     archives: Vec<(String, u64)>,
-    tools: Vec<(String, bool)>,
+    tools: Vec<(String, bool, BTreeMap<String, bool>)>,
     blockers: Vec<String>,
 }
 fn inspect(game: &Path) -> io::Result<InspectResult> {
-    let plan = new_plan(game, None, false)?;
+    let plan = new_plan(game, None, &[], false)?;
     let mut media = BTreeMap::<String, MediaCount>::new();
     let mut archives = Vec::new();
     for entry in &plan.entries {
@@ -126,19 +159,7 @@ fn inspect(game: &Path) -> io::Result<InspectResult> {
                 entry.size,
             ));
         }
-        let kind = match detect(&path)? {
-            compressor_media::ImageFormat::Png => "png",
-            compressor_media::ImageFormat::AnimatedPng => "apng",
-            compressor_media::ImageFormat::Jpeg => "jpeg",
-            compressor_media::ImageFormat::Webp => "webp",
-            compressor_media::ImageFormat::AnimatedWebp => "animated_webp",
-            _ => "other",
-        };
-        let item = media
-            .entry(kind.into())
-            .or_insert(MediaCount { count: 0, bytes: 0 });
-        item.count += 1;
-        item.bytes += entry.size;
+        compressor_media::summarize_file(&mut media, &path, entry.size)?;
     }
     let tools = plan
         .tools
@@ -146,9 +167,22 @@ fn inspect(game: &Path) -> io::Result<InspectResult> {
         .map(|tool| {
             let mut p = plan.clone();
             p.tools = vec![tool.clone()];
+            let features = tool
+                .features
+                .iter()
+                .map(|feature| {
+                    let mut single = p.clone();
+                    single.tools[0].features = vec![feature.clone()];
+                    (
+                        feature.clone(),
+                        compressor_core::tools::check_tools(&single).is_ok(),
+                    )
+                })
+                .collect();
             (
                 tool.name.clone(),
                 compressor_core::tools::check_tools(&p).is_ok(),
+                features,
             )
         })
         .collect();
@@ -188,6 +222,70 @@ async fn main() {
 }
 async fn run(cli: Cli) -> io::Result<i32> {
     match cli.command {
+        Commands::Settings {
+            game,
+            engine,
+            profile,
+            set,
+            json,
+        } => {
+            let engines = engine_registry(false);
+            let id = if let Some(game) = game {
+                engines
+                    .detect(&game)?
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "no supported engine detected")
+                    })?
+                    .0
+                    .id()
+                    .to_owned()
+            } else {
+                engine.unwrap_or_else(|| "renpy".into())
+            };
+            let adapter = engines.by_id(&id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "unknown engine {id}; known engines: {}",
+                        engines.ids().join(", ")
+                    ),
+                )
+            })?;
+            let settings = compressor_core::settings::resolve(
+                profile.as_deref(),
+                &set,
+                &id,
+                &engine_specs(&engines),
+            )?;
+            let options = adapter.options();
+            if json {
+                print_json(
+                    &serde_json::json!({"engine": id, "settings": settings, "options": options}),
+                )?;
+            } else {
+                for (key, value) in &settings.values {
+                    println!("{key} = {} (source: {})", value.value, value.source);
+                }
+                for option in &options {
+                    let value = &settings.engine_options[&option.name];
+                    let allowed = match &option.kind {
+                        compressor_core::OptionKind::Enum(v) => v.join(", "),
+                        compressor_core::OptionKind::Bool => "true, false".into(),
+                        compressor_core::OptionKind::Int { min, max } => format!("{min}–{max}"),
+                    };
+                    let display = value
+                        .value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.value.to_string());
+                    println!(
+                        "engines.{id}.{} = {display} (source: {}; allowed: {allowed})",
+                        option.name, value.source
+                    );
+                }
+            }
+            Ok(0)
+        }
         Commands::Inspect { game, json } => {
             let result = inspect(&game)?;
             if json {
@@ -204,11 +302,17 @@ async fn run(cli: Cli) -> io::Result<i32> {
                 for (name, size) in result.archives {
                     println!("archive: {name} ({size} bytes)");
                 }
-                for (name, available) in result.tools {
+                for (name, available, features) in result.tools {
                     println!(
                         "{name}: {}",
                         if available { "available" } else { "missing" }
                     );
+                    for (feature, available) in features {
+                        println!(
+                            "  {feature}: {}",
+                            if available { "available" } else { "missing" }
+                        );
+                    }
                 }
                 for blocker in result.blockers {
                     println!("blocked: {blocker}");
@@ -219,11 +323,12 @@ async fn run(cli: Cli) -> io::Result<i32> {
         Commands::Plan {
             game,
             profile,
+            set,
             list,
             save,
             json,
         } => {
-            let plan = new_plan(&game, profile.as_deref(), false)?;
+            let plan = new_plan(&game, profile.as_deref(), &set, false)?;
             if let Some(path) = save {
                 std::fs::write(path, serde_json::to_vec_pretty(&plan)?)?;
             }
@@ -231,6 +336,37 @@ async fn run(cli: Cli) -> io::Result<i32> {
                 print_json(&plan)?;
             } else {
                 for (kind, count) in plan_counts(&plan) {
+                    println!("{kind}: {count}");
+                }
+                let mut by_media = BTreeMap::<String, usize>::new();
+                for entry in &plan.entries {
+                    let media = match &entry.action {
+                        Action::Convert { kind, .. } => format!("{kind:?}").to_lowercase(),
+                        _ => {
+                            let path = plan.input_root.0.join(&entry.path.0);
+                            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+                                if compressor_media::detect(&path)
+                                    .is_ok_and(|f| f != compressor_media::ImageFormat::Unsupported)
+                                {
+                                    "image".into()
+                                } else if compressor_media::audio::sniff(&path).is_ok() {
+                                    "audio".into()
+                                } else {
+                                    "other".into()
+                                }
+                            } else {
+                                "other".into()
+                            }
+                        }
+                    };
+                    let action = match &entry.action {
+                        Action::Convert { .. } => "convert".to_owned(),
+                        Action::Copy { reason } => format!("copy: {reason}"),
+                        Action::Skip { reason } => format!("skip: {reason}"),
+                    };
+                    *by_media.entry(format!("{media} {action}")).or_default() += 1;
+                }
+                for (kind, count) in by_media {
                     println!("{kind}: {count}");
                 }
                 if list {
@@ -245,16 +381,17 @@ async fn run(cli: Cli) -> io::Result<i32> {
             game,
             output,
             profile,
+            set,
             plan,
             jobs,
             allow_unknown_version,
         } => {
             let plan = if let Some(file) = plan {
-                let plan: Plan = serde_json::from_slice(&std::fs::read(file)?)?;
+                let plan = compressor_core::planning::read_plan(&file)?;
                 validate_plan(&plan, &game)?;
                 plan
             } else {
-                new_plan(&game, profile.as_deref(), allow_unknown_version)?
+                new_plan(&game, profile.as_deref(), &set, allow_unknown_version)?
             };
             let (sender, mut receiver) = tokio::sync::broadcast::channel(1024);
             let is_tty = std::io::stderr().is_terminal();
@@ -378,8 +515,8 @@ struct VerifyResult {
     errors: Vec<String>,
 }
 async fn verify(output: &Path) -> io::Result<VerifyResult> {
-    let manifest: compressor_core::Manifest =
-        serde_json::from_slice(&std::fs::read(output.join(".compressor/manifest.json"))?)?;
+    let manifest =
+        compressor_core::planning::read_manifest(&output.join(".compressor/manifest.json"))?;
     let mut result = VerifyResult {
         checked: 0,
         errors: vec![],
@@ -415,8 +552,35 @@ async fn verify(output: &Path) -> io::Result<VerifyResult> {
             }
         }
         if entry.outcome.starts_with("converted") {
-            if let Err(e) = WebpTransformer::validate_output(&path, &CancellationToken::new()).await
-            {
+            let action = manifest
+                .plan
+                .entries
+                .iter()
+                .find(|planned| planned.path == entry.path)
+                .map(|planned| &planned.action);
+            let checked = match action {
+                Some(Action::Convert {
+                    settings: compressor_core::ConvertSettings::Image(_),
+                    ..
+                }) => WebpTransformer::validate_output(&path, &CancellationToken::new()).await,
+                Some(Action::Convert {
+                    settings: settings @ compressor_core::ConvertSettings::Audio(_),
+                    ..
+                }) => {
+                    AudioTransformer::validate_output(
+                        &path,
+                        settings,
+                        &CancellationToken::new(),
+                        &CancellationToken::new(),
+                    )
+                    .await
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing conversion settings",
+                )),
+            };
+            if let Err(e) = checked {
                 result
                     .errors
                     .push(format!("{}: {e}", entry.path.0.display()));

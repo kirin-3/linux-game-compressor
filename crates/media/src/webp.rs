@@ -1,14 +1,18 @@
 use compressor_core::{
     process::run_process,
     registry::{Operation, Transformer},
-    MediaKind, Profile, ToolSpec,
+    ConvertSettings, ImageSettings, MediaKind, ToolSpec,
 };
 use std::{ffi::OsString, io, path::Path, process::Command};
 use tokio_util::sync::CancellationToken;
 
 pub struct WebpTransformer;
 impl WebpTransformer {
-    pub fn arguments(source: &Path, output: &Path, profile: &Profile) -> io::Result<Vec<OsString>> {
+    pub fn arguments(
+        source: &Path,
+        output: &Path,
+        settings: &ImageSettings,
+    ) -> io::Result<Vec<OsString>> {
         if !source.is_absolute() || !output.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -20,13 +24,13 @@ impl WebpTransformer {
             "-metadata".into(),
             "none".into(),
             "-q".into(),
-            profile.quality.to_string().into(),
+            settings.quality.to_string().into(),
             "-m".into(),
-            profile.effort.to_string().into(),
+            settings.effort.to_string().into(),
             "-alpha_q".into(),
             "100".into(),
         ];
-        if profile.sharp_yuv {
+        if settings.sharp_yuv {
             args.push("-sharp_yuv".into());
         }
         args.extend([
@@ -79,6 +83,7 @@ impl Transformer for WebpTransformer {
             .map(|name| ToolSpec {
                 name: name.into(),
                 package: "libwebp-utils".into(),
+                features: vec![],
             })
             .collect()
     }
@@ -86,12 +91,12 @@ impl Transformer for WebpTransformer {
         &'a self,
         source: &'a Path,
         output: &'a Path,
-        profile: &'a Profile,
+        settings: &'a ConvertSettings,
         cancel: &'a CancellationToken,
-    ) -> Operation<'a, ()> {
+    ) -> Operation<'a, Option<String>> {
         Box::pin(async move {
             let force = CancellationToken::new();
-            self.transform_with_force(source, output, profile, cancel, &force)
+            self.transform_with_force(source, output, settings, cancel, &force)
                 .await
         })
     }
@@ -99,12 +104,18 @@ impl Transformer for WebpTransformer {
         &'a self,
         source: &'a Path,
         output: &'a Path,
-        profile: &'a Profile,
+        settings: &'a ConvertSettings,
         cancel: &'a CancellationToken,
         force: &'a CancellationToken,
-    ) -> Operation<'a, ()> {
+    ) -> Operation<'a, Option<String>> {
         Box::pin(async move {
-            let args = Self::arguments(source, output, profile)?;
+            let ConvertSettings::Image(image) = settings else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "expected image settings",
+                ));
+            };
+            let args = Self::arguments(source, output, image)?;
             let result = run_process("cwebp".as_ref(), args, cancel, force).await?;
             if result.cancelled {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
@@ -115,18 +126,19 @@ impl Transformer for WebpTransformer {
                     String::from_utf8_lossy(&result.stderr)
                 )));
             }
-            Ok(())
+            Ok(Some("metadata dropped".into()))
         })
     }
     fn validate<'a>(
         &'a self,
         source: &'a Path,
         output: &'a Path,
+        settings: &'a ConvertSettings,
         cancel: &'a CancellationToken,
     ) -> Operation<'a, ()> {
         Box::pin(async move {
             let force = CancellationToken::new();
-            self.validate_with_force(source, output, cancel, &force)
+            self.validate_with_force(source, output, settings, cancel, &force)
                 .await
         })
     }
@@ -134,10 +146,17 @@ impl Transformer for WebpTransformer {
         &'a self,
         source: &'a Path,
         output: &'a Path,
+        settings: &'a ConvertSettings,
         cancel: &'a CancellationToken,
         force: &'a CancellationToken,
     ) -> Operation<'a, ()> {
         Box::pin(async move {
+            if !matches!(settings, ConvertSettings::Image(_)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "expected image settings",
+                ));
+            }
             if matches!(
                 crate::detect(source)?,
                 crate::ImageFormat::AnimatedPng | crate::ImageFormat::AnimatedWebp
@@ -267,11 +286,11 @@ mod tests {
     use super::*;
     #[test]
     fn arguments_follow_profile_and_are_absolute() {
-        let p = Profile {
+        let p = ImageSettings {
             quality: 90,
             effort: 6,
             sharp_yuv: true,
-            ..Profile::default()
+            reencode_webp: false,
         };
         let args =
             WebpTransformer::arguments(Path::new("/game/-a.png"), Path::new("/tmp/out.webp"), &p)
@@ -309,19 +328,19 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let output = dir.path().join("encoded.webp");
         let token = CancellationToken::new();
-        let p = Profile::default();
+        let p = ConvertSettings::Image(compressor_core::ResolvedSettings::default().image());
         let codec = WebpTransformer;
         let transparent = images.join("sprite transparent.png");
         codec.transform(&transparent, &output, &p, &token).await?;
-        codec.validate(&transparent, &output, &token).await?;
+        codec.validate(&transparent, &output, &p, &token).await?;
         codec
             .transform(&images.join("rgba-opaque.png"), &output, &p, &token)
             .await?;
         codec
-            .validate(&images.join("rgba-opaque.png"), &output, &token)
+            .validate(&images.join("rgba-opaque.png"), &output, &p, &token)
             .await?;
         assert!(codec
-            .validate(&transparent, &output, &token)
+            .validate(&transparent, &output, &p, &token)
             .await
             .unwrap_err()
             .to_string()
@@ -332,14 +351,14 @@ mod tests {
             .map_err(io::Error::other)?;
         codec.transform(&different, &output, &p, &token).await?;
         assert!(codec
-            .validate(&transparent, &output, &token)
+            .validate(&transparent, &output, &p, &token)
             .await
             .unwrap_err()
             .to_string()
             .contains("dimensions changed"));
         std::fs::write(&output, b"RIFFtruncated")?;
         assert!(codec
-            .validate(&transparent, &output, &token)
+            .validate(&transparent, &output, &p, &token)
             .await
             .unwrap_err()
             .to_string()
@@ -365,14 +384,20 @@ mod tests {
             .arg(&source)
             .status()?;
         assert!(status.success());
-        let profile = compressor_core::profile::load_profile(Some("small"))?;
+        let resolved = compressor_core::settings::resolve(
+            Some("small"),
+            &[],
+            "test",
+            &std::collections::BTreeMap::from([("test".into(), vec![])]),
+        )?;
+        let profile = ConvertSettings::Image(resolved.image());
         let converted = dir.path().join("check.webp");
         let token = CancellationToken::new();
         WebpTransformer
             .transform(&source, &converted, &profile, &token)
             .await?;
         WebpTransformer
-            .validate(&source, &converted, &token)
+            .validate(&source, &converted, &profile, &token)
             .await?;
         assert!(webp_has_alpha(&converted)?);
         let opaque = dir.path().join("opaque.webp");
@@ -385,7 +410,7 @@ mod tests {
             )
             .await?;
         assert!(WebpTransformer
-            .validate(&source, &opaque, &token)
+            .validate(&source, &opaque, &profile, &token)
             .await
             .unwrap_err()
             .to_string()
@@ -393,7 +418,7 @@ mod tests {
         assert!(std::fs::metadata(&converted)?.len() >= std::fs::metadata(&source)?.len());
         let (size, hash) = compressor_core::planning::hash_input(&source)?;
         let plan = Plan {
-            plan_version: 1,
+            plan_version: 2,
             input_root: StoredPath(source_dir.canonicalize()?),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -402,7 +427,7 @@ mod tests {
                 notes: vec![],
                 version_check_overridden: false,
             },
-            profile: profile.clone(),
+            settings: resolved,
             tools: WebpTransformer.required_tools(),
             entries: vec![Entry {
                 path: StoredPath("sprite.png".into()),
@@ -457,7 +482,7 @@ mod tests {
             .transform(
                 &fixture.root().join("game/images/café.jpg"),
                 &output,
-                &Profile::default(),
+                &ConvertSettings::Image(compressor_core::ResolvedSettings::default().image()),
                 &CancellationToken::new(),
             )
             .await?;
@@ -479,7 +504,7 @@ mod tests {
             .transform(
                 &fixture.root().join("game/images/opaque.png"),
                 &output,
-                &Profile::default(),
+                &ConvertSettings::Image(compressor_core::ResolvedSettings::default().image()),
                 &CancellationToken::new(),
             )
             .await?;

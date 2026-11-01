@@ -41,6 +41,35 @@ fn check_tools_with_path(tools: &[ToolSpec], path: &OsStr) -> io::Result<Vec<Too
                 tool.name, tool.package
             )));
         }
+        if !tool.features.is_empty() {
+            let encoders = Command::new(&executable)
+                .args(["-hide_banner", "-encoders"])
+                .stdin(Stdio::null())
+                .output()?;
+            if !encoders.status.success() {
+                return Err(io::Error::other(format!(
+                    "{} from {} could not list encoders",
+                    tool.name, tool.package
+                )));
+            }
+            let text = String::from_utf8_lossy(&encoders.stdout);
+            for feature in &tool.features {
+                let found = text.lines().any(|line| {
+                    let mut parts = line.split_whitespace();
+                    let flags = parts.next().unwrap_or("");
+                    flags.len() == 6 && parts.next() == Some(feature.as_str())
+                });
+                if !found {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "{} missing encoder {} (install {})",
+                            tool.name, feature, tool.package
+                        ),
+                    ));
+                }
+            }
+        }
         let bytes = if output.stdout.is_empty() {
             &output.stderr
         } else {
@@ -64,7 +93,7 @@ mod tests {
     fn empty_path_in_subprocess() -> io::Result<()> {
         if std::env::var_os("COMPRESSOR_EMPTY_PATH_TEST").is_some() {
             let plan = Plan {
-                plan_version: 1,
+                plan_version: 2,
                 input_root: StoredPath("/unused".into()),
                 engine: crate::EngineInfo {
                     name: "fake".into(),
@@ -73,10 +102,11 @@ mod tests {
                     notes: vec![],
                     version_check_overridden: false,
                 },
-                profile: crate::Profile::default(),
+                settings: crate::ResolvedSettings::default(),
                 tools: vec![ToolSpec {
                     name: "cwebp".into(),
                     package: "libwebp-utils".into(),
+                    features: vec![],
                 }],
                 entries: vec![],
             };
@@ -110,6 +140,7 @@ mod tests {
             &[ToolSpec {
                 name: "cwebp".into(),
                 package: "libwebp-utils".into(),
+                features: vec![],
             }],
             OsStr::new(""),
         )
@@ -117,6 +148,29 @@ mod tests {
         assert!(err.to_string().contains("cwebp"));
         assert!(err.to_string().contains("libwebp-utils"));
         assert!(!output.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn checks_required_ffmpeg_encoders() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ffmpeg = dir.path().join("ffmpeg");
+        let write = |encoders: &str| -> io::Result<()> {
+            std::fs::write(&ffmpeg, format!("#!/bin/sh\nif [ \"$1\" = -version ]; then echo ffmpeg-test; else printf '%s\\n' '{encoders}'; fi\n"))?;
+            std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o755))
+        };
+        let tools = [ToolSpec {
+            name: "ffmpeg".into(),
+            package: "ffmpeg".into(),
+            features: vec!["libopus".into()],
+        }];
+        write(" A..... libopus Opus encoder")?;
+        assert!(check_tools_with_path(&tools, dir.path().as_os_str()).is_ok());
+        write(" A..... libvorbis libopus in description")?;
+        let err = check_tools_with_path(&tools, dir.path().as_os_str())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("libopus") && err.contains("ffmpeg"), "{err}");
         Ok(())
     }
 }

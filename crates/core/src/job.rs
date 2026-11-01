@@ -88,16 +88,12 @@ pub async fn run_job_with_force(
     }
     validate_plan(plan, &plan.input_root.0)?;
     let output = check_output(&plan.input_root.0, output)?;
-    let tools = check_tools(plan)?;
     let metadata = output.join(".compressor");
     let existing = if metadata.join("manifest.json").exists() {
-        let manifest: crate::Manifest =
-            serde_json::from_slice(&std::fs::read(metadata.join("manifest.json"))?)?;
+        let manifest = crate::planning::read_manifest(&metadata.join("manifest.json"))?;
         Some(manifest.plan)
     } else if metadata.join("plan.json").exists() {
-        Some(serde_json::from_slice::<Plan>(&std::fs::read(
-            metadata.join("plan.json"),
-        )?)?)
+        Some(crate::planning::read_plan(&metadata.join("plan.json"))?)
     } else {
         None
     };
@@ -109,6 +105,7 @@ pub async fn run_job_with_force(
             ));
         }
     }
+    let tools = check_tools(plan)?;
     std::fs::create_dir_all(metadata.join("tmp"))?;
     journal::write_json_atomic(&metadata.join("plan.json"), plan)?;
     let journal = Arc::new(Mutex::new(Journal::open(&metadata.join("journal.jsonl"))?));
@@ -172,7 +169,7 @@ pub async fn run_job_with_force(
             let action = async {
                 let (outcome, failure, exists) = match (&entry.action, transformer) {
                     (Action::Convert { settings, .. }, Some(t)) => match transform_one_with_force(root.join(&path.0), destination.clone(), temporary.clone(), settings.clone(), t, &token, &force).await? {
-                        ConversionOutcome::Converted => ("converted; metadata dropped".into(), false, true),
+                        ConversionOutcome::Converted { note } => (note.map_or_else(|| "converted".to_owned(), |n| format!("converted; {n}")), false, true),
                         ConversionOutcome::KeptOriginal { reason, failed } => (reason, failed, true),
                     },
                     (Action::Copy { reason } | Action::Skip { reason }, _) => {
@@ -303,11 +300,14 @@ mod tests {
     use super::*;
     use crate::{
         registry::{EngineAdapter, Operation, Transformer},
-        EngineInfo, MediaKind, Profile, ToolSpec,
+        EngineInfo, MediaKind, ToolSpec,
     };
     use std::{collections::BTreeMap, os::unix::fs::MetadataExt};
     struct Adapter;
     impl EngineAdapter for Adapter {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
         fn detect(&self, _: &Path) -> io::Result<Option<EngineInfo>> {
             unreachable!()
         }
@@ -316,14 +316,14 @@ mod tests {
             _: &Path,
             path: &Path,
             _: &EngineInfo,
-            profile: &Profile,
+            profile: &crate::ResolvedSettings,
         ) -> io::Result<Action> {
             if path == Path::new("game/images/opaque.png") {
                 Ok(Action::Convert {
                     kind: MediaKind::Image,
                     target: "webp".into(),
                     encoder: "fake".into(),
-                    settings: profile.clone(),
+                    settings: crate::ConvertSettings::Image(profile.image()),
                 })
             } else {
                 Ok(Action::Copy {
@@ -347,9 +347,9 @@ mod tests {
             &'a self,
             _: &'a Path,
             dest: &'a Path,
-            _: &'a Profile,
+            _: &'a crate::ConvertSettings,
             cancel: &'a CancellationToken,
-        ) -> Operation<'a, ()> {
+        ) -> Operation<'a, Option<String>> {
             Box::pin(async move {
                 if self.wait {
                     tokio::select! { _=cancel.cancelled()=>return Err(io::Error::new(io::ErrorKind::Interrupted,"cancelled")), _=tokio::time::sleep(std::time::Duration::from_secs(2))=>{} }
@@ -357,13 +357,15 @@ mod tests {
                 if self.fail {
                     return Err(io::Error::other("fake failure"));
                 }
-                tokio::fs::write(dest, b"tiny").await
+                tokio::fs::write(dest, b"tiny").await?;
+                Ok(Some("fake note".into()))
             })
         }
         fn validate<'a>(
             &'a self,
             _: &'a Path,
             _: &'a Path,
+            _: &'a crate::ConvertSettings,
             _: &'a CancellationToken,
         ) -> Operation<'a, ()> {
             Box::pin(async { Ok(()) })
@@ -408,7 +410,7 @@ mod tests {
                 &input,
                 &Adapter,
                 engine,
-                Profile::default(),
+                crate::ResolvedSettings::default(),
                 &registry,
             )?;
             let (sender, mut receiver) = broadcast::channel(4096);
@@ -431,6 +433,17 @@ mod tests {
                 let report = result?;
                 assert!(report.complete);
                 assert_eq!(report.failures.len(), usize::from(mode == "failure"));
+                if mode == "success" {
+                    let manifest =
+                        crate::planning::read_manifest(&out.join(".compressor/manifest.json"))?;
+                    let converted = manifest
+                        .entries
+                        .iter()
+                        .find(|e| e.path.0 == Path::new("game/images/opaque.png"))
+                        .unwrap();
+                    assert_eq!(converted.outcome, "converted; fake note");
+                    assert!(!report.skips.iter().any(|e| e.path == converted.path));
+                }
                 let mut count = 0;
                 while let Ok(event) = receiver.try_recv() {
                     if matches!(event, Event::FileResult { .. }) {

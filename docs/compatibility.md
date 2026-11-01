@@ -54,3 +54,20 @@ dialogue scene with the character's side sprite. The displayed `z1.jpeg` CG
 and `zenochar1.png` sprite were both converted WebP data under their original
 names. No image errors appeared in `log.txt`; Wine did report an unrelated
 Steam initialization warning because no Steam client was installed.
+# Audio compatibility
+
+Ren'Py 6.99.9 added Opus playback to its default distributions, according to the [Ren'Py 6.99.9 changelog](https://www.renpy.org/doc/html/changelog6.html#ren-py-6-99-9). The compressor uses this as its minimum for Opus output; unknown or older versions fall back to Vorbis for `.ogg` files and skip `.opus` files unless the version check is overridden.
+
+Ren'Py Ogg Vorbis and Opus sources are encoded as Opus by default, or Vorbis
+when `ogg_target` is `vorbis`; MP3 sources remain MP3. Audio filenames and
+extensions are preserved. WAV, FLAC, and other unsupported formats are copied.
+Text tags, including Vorbis loop comments, are retained; embedded pictures are
+dropped and noted in the report. MP3 encoder delay and padding can shift loop
+points, so sample-exact MP3 loops are not guaranteed.
+
+The default profile was run on RENPY_1 (Ren'Py 8.5.0): 1,308,864,554 input
+bytes became 435,139,556 bytes, saving 873,724,998 bytes (66.75%). Audio
+conversions saved 59,171,172 bytes. The run reported no failures, and all
+3,212 files passed `compressor verify` (exit 0).
+The user played the converted build and confirmed that music, sound effects,
+and a looping track played correctly.

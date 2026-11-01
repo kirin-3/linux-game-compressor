@@ -1,11 +1,54 @@
 //! Content-based image detection and WebP conversion.
 
+pub mod audio;
 pub mod webp;
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{self, Cursor, Read, Seek, SeekFrom},
     path::Path,
 };
+
+#[derive(Debug, Default, serde::Serialize, PartialEq, Eq)]
+pub struct MediaCount {
+    pub count: u64,
+    pub bytes: u64,
+}
+
+/// Add a regular file to a content-based media summary.
+pub fn summarize_file(
+    summary: &mut BTreeMap<String, MediaCount>,
+    path: &Path,
+    size: u64,
+) -> io::Result<()> {
+    let kind = match detect(path)? {
+        ImageFormat::Png => "png",
+        ImageFormat::AnimatedPng => "apng",
+        ImageFormat::Jpeg => "jpeg",
+        ImageFormat::Webp => "webp",
+        ImageFormat::AnimatedWebp => "animated_webp",
+        ImageFormat::Unsupported => match audio::sniff(path) {
+            Ok(info) => match info.codec {
+                audio::Codec::Vorbis => "vorbis",
+                audio::Codec::Opus => "opus",
+                audio::Codec::Mp3 => "mp3",
+            },
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                "other"
+            }
+            Err(e) => return Err(e),
+        },
+    };
+    let entry = summary.entry(kind.into()).or_default();
+    entry.count += 1;
+    entry.bytes += size;
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageFormat {
@@ -72,6 +115,51 @@ fn detect_reader(reader: &mut (impl Read + Seek)) -> io::Result<ImageFormat> {
 mod tests {
     use super::*;
     use compressor_test_fixtures::Fixture;
+    #[test]
+    fn summary_counts_mixed_audio_and_images() -> io::Result<()> {
+        let fixture = Fixture::new()?;
+        let dir = tempfile::tempdir()?;
+        let image = dir.path().join("image.png");
+        std::fs::copy(fixture.root().join("game/icon.png"), &image)?;
+        let audio = dir.path().join("music.ogg");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=duration=1",
+                "-c:a",
+                "libvorbis",
+                "-y",
+            ])
+            .arg(&audio)
+            .status()?;
+        assert!(status.success());
+        let mut summary = BTreeMap::new();
+        for entry in std::fs::read_dir(dir.path())? {
+            let entry = entry?;
+            summarize_file(&mut summary, &entry.path(), entry.metadata()?.len())?;
+        }
+        assert_eq!(
+            summary["png"],
+            MediaCount {
+                count: 1,
+                bytes: std::fs::metadata(image)?.len()
+            }
+        );
+        assert_eq!(
+            summary["vorbis"],
+            MediaCount {
+                count: 1,
+                bytes: std::fs::metadata(audio)?.len()
+            }
+        );
+        Ok(())
+    }
     #[test]
     fn recognizes_content_and_animation() -> io::Result<()> {
         let fixture = Fixture::new()?;

@@ -1,6 +1,7 @@
 //! Ren'Py game detection and classification.
 use compressor_core::{
-    registry::EngineAdapter, Action, EngineInfo, MediaKind, Profile, StoredPath,
+    registry::EngineAdapter, Action, EngineInfo, MediaKind, OptionKind, OptionSpec,
+    ResolvedSettings, StoredPath,
 };
 use compressor_media::{detect, ImageFormat};
 use regex::Regex;
@@ -16,12 +17,38 @@ static ICON: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?m)\bconfig\.window_icon\s*=\s*['"]([^'"\r\n]+)['"]"#).unwrap()
 });
 pub const MIN_WEBP_VERSION: (u32, u32, u32) = (6, 99, 12);
+// Ren'Py 6.99.9 added Opus to default distributions:
+// https://www.renpy.org/doc/html/changelog6.html#ren-py-6-99-9
+pub const MIN_OPUS_VERSION: (u32, u32, u32) = (6, 99, 9);
+
+fn supports_opus(engine: &EngineInfo) -> bool {
+    if engine.version_check_overridden {
+        return true;
+    }
+    let Some(parts) = engine.version.as_deref().and_then(|v| {
+        let mut p = v.split('.').map(str::parse::<u32>);
+        Some((p.next()?.ok()?, p.next()?.ok()?, p.next()?.ok()?))
+    }) else {
+        return false;
+    };
+    parts >= MIN_OPUS_VERSION
+}
 
 #[derive(Default)]
 pub struct RenpyAdapter {
     pub allow_unknown_version: bool,
 }
 impl EngineAdapter for RenpyAdapter {
+    fn id(&self) -> &'static str {
+        "renpy"
+    }
+    fn options(&self) -> Vec<OptionSpec> {
+        vec![OptionSpec {
+            name: "ogg_target".into(),
+            kind: OptionKind::Enum(vec!["opus".into(), "vorbis".into()]),
+            default: serde_json::json!("opus"),
+        }]
+    }
     fn detect(&self, root: &Path) -> io::Result<Option<EngineInfo>> {
         if !root.join("game").is_dir() || !root.join("renpy").is_dir() {
             return Ok(None);
@@ -84,8 +111,9 @@ impl EngineAdapter for RenpyAdapter {
         root: &Path,
         relative: &Path,
         engine: &EngineInfo,
-        profile: &Profile,
+        settings: &ResolvedSettings,
     ) -> io::Result<Action> {
+        let image = settings.image();
         let copy = |reason: &str| Action::Copy {
             reason: reason.into(),
         };
@@ -113,6 +141,90 @@ impl EngineAdapter for RenpyAdapter {
         }
         if ["rpa", "rpi"].contains(&ext.as_str()) {
             return Ok(copy("contents not processed"));
+        }
+        if ["ogg", "opus", "mp3"].contains(&ext.as_str()) {
+            use compressor_core::{AudioCodec, AudioEncode, AudioProps, ConvertSettings};
+            use compressor_media::audio::{self, Codec, Container};
+            let info = match audio::sniff(&source) {
+                Ok(info) => info,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    return Ok(skip("unsupported audio format".into()))
+                }
+                Err(err) => return Err(err),
+            };
+            if info.channels > 2 {
+                return Ok(skip("more than two channels".into()));
+            }
+            let mut target = if info.codec == Codec::Mp3 {
+                AudioCodec::Mp3
+            } else if ext == "opus" {
+                AudioCodec::Opus
+            } else if ext == "ogg" {
+                if settings
+                    .engine_options
+                    .get("ogg_target")
+                    .and_then(|v| v.value.as_str())
+                    .unwrap_or("opus")
+                    == "vorbis"
+                {
+                    AudioCodec::Vorbis
+                } else {
+                    AudioCodec::Opus
+                }
+            } else {
+                return Ok(skip("unsupported audio format".into()));
+            };
+            if target == AudioCodec::Opus && !supports_opus(engine) {
+                if ext == "opus" {
+                    return Ok(skip(format!(
+                        "engine version {} does not support Opus",
+                        engine.version.as_deref().unwrap_or("unknown")
+                    )));
+                }
+                target = AudioCodec::Vorbis;
+            }
+            let audio = settings.audio();
+            let nominal = match target {
+                AudioCodec::Opus => audio.opus_kbps_per_channel,
+                AudioCodec::Mp3 => audio.mp3_kbps_per_channel,
+                AudioCodec::Vorbis => [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 250]
+                    [usize::from(audio.vorbis_quality)],
+            } * info.channels;
+            if info.avg_kbps <= nominal {
+                return Ok(skip("already at or below target bitrate".into()));
+            }
+            let container = match info.container {
+                Container::Ogg => "ogg",
+                Container::Mp3 => "mp3",
+            };
+            return Ok(Action::Convert {
+                kind: MediaKind::Audio,
+                target: container.into(),
+                encoder: "ffmpeg".into(),
+                settings: ConvertSettings::Audio(AudioEncode {
+                    codec: target.clone(),
+                    bitrate_kbps: if target == AudioCodec::Vorbis {
+                        None
+                    } else {
+                        Some(nominal)
+                    },
+                    vorbis_quality: if target == AudioCodec::Vorbis {
+                        Some(audio.vorbis_quality)
+                    } else {
+                        None
+                    },
+                    source: AudioProps {
+                        channels: info.channels,
+                        sample_rate: info.sample_rate,
+                        duration_ms: info.duration_ms,
+                    },
+                }),
+            });
         }
         let name = game_path
             .file_name()
@@ -144,7 +256,7 @@ impl EngineAdapter for RenpyAdapter {
         {
             return Ok(skip("loaded outside image pipeline".into()));
         }
-        if ext == "webp" && !profile.reencode_webp {
+        if ext == "webp" && !image.reencode_webp {
             return Ok(skip("already WebP".into()));
         }
         if !["png", "jpg", "jpeg", "webp"].contains(&ext.as_str()) {
@@ -171,21 +283,308 @@ impl EngineAdapter for RenpyAdapter {
         }
         Ok(match detect(&source)? {
             ImageFormat::AnimatedPng | ImageFormat::AnimatedWebp => skip("animated image".into()),
-            ImageFormat::Webp if !profile.reencode_webp => skip("already WebP".into()),
+            ImageFormat::Webp if !image.reencode_webp => skip("already WebP".into()),
             ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Webp => Action::Convert {
                 kind: MediaKind::Image,
                 target: "webp".into(),
                 encoder: "cwebp".into(),
-                settings: profile.clone(),
+                settings: compressor_core::ConvertSettings::Image(settings.image()),
             },
             ImageFormat::Unsupported => skip("unsupported source format".into()),
         })
+    }
+    fn plan_notes(
+        &self,
+        _root: &Path,
+        engine: &EngineInfo,
+        settings: &ResolvedSettings,
+        entries: &[compressor_core::Entry],
+    ) -> Vec<String> {
+        if supports_opus(engine)
+            || settings
+                .engine_options
+                .get("ogg_target")
+                .and_then(|v| v.value.as_str())
+                .unwrap_or("opus")
+                != "opus"
+        {
+            return vec![];
+        }
+        // Every Vorbis conversion of a `.ogg` file here is a fallback from Opus.
+        let fallback = entries.iter().any(|entry| {
+            entry
+                .path
+                .0
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("ogg"))
+                && matches!(
+                    &entry.action,
+                    Action::Convert {
+                        settings: compressor_core::ConvertSettings::Audio(audio),
+                        ..
+                    } if audio.codec == compressor_core::AudioCodec::Vorbis
+                )
+        });
+        if fallback {
+            vec![format!("Opus was not used because engine version {} does not support Opus; Vorbis selected", engine.version.as_deref().unwrap_or("unknown"))]
+        } else {
+            vec![]
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn generate_audio(path: &Path, channels: u32, args: &[&str]) -> io::Result<()> {
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anoisesrc=duration=5:sample_rate=44100",
+                "-ac",
+                &channels.to_string(),
+            ])
+            .args(args)
+            .arg("-y")
+            .arg(path)
+            .status()?;
+        assert!(status.success());
+        Ok(())
+    }
+    #[test]
+    fn classifies_audio_by_content_and_target() -> io::Result<()> {
+        let fixture = compressor_test_fixtures::Fixture::new()?;
+        let root = fixture.root();
+        let dir = root.join("game/audio");
+        fs::create_dir_all(&dir)?;
+        generate_audio(
+            &dir.join("THEME.OGG"),
+            2,
+            &["-c:a", "libvorbis", "-q:a", "8"],
+        )?;
+        generate_audio(
+            &dir.join("mislabel.ogg"),
+            2,
+            &["-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3"],
+        )?;
+        generate_audio(
+            &dir.join("quiet.ogg"),
+            1,
+            &["-c:a", "libvorbis", "-b:a", "32k"],
+        )?;
+        generate_audio(
+            &dir.join("surround.ogg"),
+            6,
+            &["-c:a", "libvorbis", "-q:a", "5"],
+        )?;
+        generate_audio(&dir.join("flac.ogg"), 2, &["-c:a", "flac", "-f", "ogg"])?;
+        generate_audio(
+            &dir.join("sound.mp3"),
+            2,
+            &["-c:a", "libmp3lame", "-b:a", "192k"],
+        )?;
+        fs::copy(dir.join("THEME.OGG"), dir.join("theme.opus"))?;
+        fs::write(dir.join("click.wav"), b"wave")?;
+        let adapter = RenpyAdapter::default();
+        let engine = adapter.detect(root)?.unwrap();
+        let specs = std::collections::BTreeMap::from([("renpy".into(), adapter.options())]);
+        let settings = compressor_core::settings::resolve(None, &[], "renpy", &specs)?;
+        let classify = |name: &str, settings: &ResolvedSettings| {
+            adapter
+                .classify(root, &Path::new("game/audio").join(name), &engine, settings)
+                .unwrap()
+        };
+        match classify("THEME.OGG", &settings) {
+            Action::Convert {
+                settings: compressor_core::ConvertSettings::Audio(a),
+                ..
+            } => {
+                assert_eq!(a.codec, compressor_core::AudioCodec::Opus);
+                assert_eq!(a.bitrate_kbps, Some(96));
+            }
+            other => panic!("{other:?}"),
+        }
+        match classify("mislabel.ogg", &settings) {
+            Action::Convert {
+                settings: compressor_core::ConvertSettings::Audio(a),
+                ..
+            } => assert_eq!(a.codec, compressor_core::AudioCodec::Mp3),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            reason(classify("quiet.ogg", &settings)),
+            "already at or below target bitrate"
+        );
+        assert_eq!(
+            reason(classify("surround.ogg", &settings)),
+            "more than two channels"
+        );
+        assert_eq!(
+            reason(classify("flac.ogg", &settings)),
+            "unsupported audio format"
+        );
+        assert!(matches!(
+            classify("sound.mp3", &settings),
+            Action::Convert {
+                settings: compressor_core::ConvertSettings::Audio(compressor_core::AudioEncode {
+                    codec: compressor_core::AudioCodec::Mp3,
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify("theme.opus", &settings),
+            Action::Convert {
+                settings: compressor_core::ConvertSettings::Audio(compressor_core::AudioEncode {
+                    codec: compressor_core::AudioCodec::Opus,
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert_eq!(
+            reason(classify("click.wav", &settings)),
+            "extension not eligible"
+        );
+        let vorbis = compressor_core::settings::resolve(
+            None,
+            &[
+                "engines.renpy.ogg_target=vorbis".into(),
+                "audio.vorbis_quality=2".into(),
+            ],
+            "renpy",
+            &specs,
+        )?;
+        match classify("THEME.OGG", &vorbis) {
+            Action::Convert {
+                settings: compressor_core::ConvertSettings::Audio(a),
+                ..
+            } => {
+                assert_eq!(a.codec, compressor_core::AudioCodec::Vorbis);
+                assert_eq!(a.vorbis_quality, Some(2));
+            }
+            other => panic!("{other:?}"),
+        }
+        Ok(())
+    }
+    #[test]
+    fn opus_version_gate_falls_back_and_reports_it() -> io::Result<()> {
+        let fixture = compressor_test_fixtures::Fixture::new()?;
+        let root = fixture.root();
+        let ogg = root.join("game/music.ogg");
+        generate_audio(&ogg, 2, &["-c:a", "libvorbis", "-q:a", "8"])?;
+        fs::copy(&ogg, root.join("game/music.opus"))?;
+        let adapter = RenpyAdapter::default();
+        let mut engine = adapter.detect(root)?.unwrap();
+        let settings = compressor_core::settings::resolve(
+            None,
+            &[],
+            "renpy",
+            &std::collections::BTreeMap::from([("renpy".into(), adapter.options())]),
+        )?;
+        let mut registry = compressor_core::registry::TransformerRegistry::default();
+        registry.register(std::sync::Arc::new(compressor_media::webp::WebpTransformer));
+        registry.register(std::sync::Arc::new(
+            compressor_media::audio::AudioTransformer,
+        ));
+        for version in [None, Some("6.99.8".to_owned())] {
+            engine.version = version;
+            let ogg_action =
+                adapter.classify(root, Path::new("game/music.ogg"), &engine, &settings)?;
+            assert!(matches!(
+                ogg_action,
+                Action::Convert {
+                    settings: compressor_core::ConvertSettings::Audio(
+                        compressor_core::AudioEncode {
+                            codec: compressor_core::AudioCodec::Vorbis,
+                            ..
+                        }
+                    ),
+                    ..
+                }
+            ));
+            assert!(reason(adapter.classify(
+                root,
+                Path::new("game/music.opus"),
+                &engine,
+                &settings
+            )?)
+            .contains("does not support Opus"));
+            let plan = compressor_core::planning::build_plan(
+                root,
+                &adapter,
+                engine.clone(),
+                settings.clone(),
+                &registry,
+            )?;
+            assert!(plan
+                .engine
+                .notes
+                .iter()
+                .any(|s| s.contains("Opus was not used")));
+        }
+        engine.version = None;
+        engine.version_check_overridden = true;
+        assert!(matches!(
+            adapter.classify(root, Path::new("game/music.ogg"), &engine, &settings)?,
+            Action::Convert {
+                settings: compressor_core::ConvertSettings::Audio(compressor_core::AudioEncode {
+                    codec: compressor_core::AudioCodec::Opus,
+                    ..
+                }),
+                ..
+            }
+        ));
+        let plan =
+            compressor_core::planning::build_plan(root, &adapter, engine, settings, &registry)?;
+        assert!(
+            compressor_core::journal::build_report(&compressor_core::journal::make_manifest(
+                plan,
+                &[],
+                false
+            ))
+            .notes
+            .iter()
+            .any(|s| s.contains("overridden"))
+        );
+        Ok(())
+    }
+    #[test]
+    fn engine_image_override_reaches_planned_action() -> io::Result<()> {
+        let fixture = compressor_test_fixtures::Fixture::new()?;
+        let adapter = RenpyAdapter::default();
+        let engine = adapter.detect(fixture.root())?.unwrap();
+        let dir = tempfile::tempdir()?;
+        let profile = dir.path().join("profile.toml");
+        fs::write(&profile, "[engines.renpy.image]\nquality = 78\n")?;
+        let specs = std::collections::BTreeMap::from([("renpy".into(), adapter.options())]);
+        let settings =
+            compressor_core::settings::resolve(profile.to_str(), &[], adapter.id(), &specs)?;
+        let action = adapter.classify(
+            fixture.root(),
+            Path::new("game/images/opaque.png"),
+            &engine,
+            &settings,
+        )?;
+        match action {
+            Action::Convert {
+                settings: compressor_core::ConvertSettings::Image(image),
+                ..
+            } => assert_eq!(image.quality, 78),
+            _ => panic!("expected image conversion"),
+        }
+        assert_eq!(adapter.id(), "renpy");
+        assert_eq!(settings.engine_options["ogg_target"].value, "opus");
+        Ok(())
+    }
     fn reason(action: Action) -> String {
         match action {
             Action::Copy { reason } | Action::Skip { reason } => reason,
@@ -230,7 +629,7 @@ mod tests {
         )?;
         let adapter = RenpyAdapter::default();
         let engine = adapter.detect(&root)?.unwrap();
-        let profile = Profile::default();
+        let profile = ResolvedSettings::default();
         let classify = |name: &str| {
             adapter
                 .classify(&root, Path::new(name), &engine, &profile)
@@ -292,7 +691,12 @@ mod tests {
             "script, save, or cache"
         );
         assert!(reason(classify("game/outside-link")).contains("outside"));
-        let small = compressor_core::profile::load_profile(Some("small"))?;
+        let small = compressor_core::settings::resolve(
+            Some("small"),
+            &[],
+            "renpy",
+            &std::collections::BTreeMap::from([("renpy".into(), adapter.options())]),
+        )?;
         assert_eq!(
             reason(adapter.classify(&root, Path::new("game/images/webp.png"), &engine, &small)?),
             "convert"
@@ -315,7 +719,7 @@ mod tests {
         let path = Path::new("game/images/opaque.png");
         let adapter = RenpyAdapter::default();
         let mut engine = adapter.detect(root)?.unwrap();
-        let profile = Profile::default();
+        let profile = ResolvedSettings::default();
         engine.version = Some("6.18.3".into());
         assert_eq!(
             reason(adapter.classify(root, path, &engine, &profile)?),
@@ -353,10 +757,10 @@ mod tests {
             &output.path().join(".compressor/journal.jsonl"),
         )?;
         let plan = compressor_core::Plan {
-            plan_version: 1,
+            plan_version: 2,
             input_root: StoredPath(root.to_owned()),
             engine: engine.clone(),
-            profile: Profile::default(),
+            settings: ResolvedSettings::default(),
             tools: vec![],
             entries: vec![],
         };
@@ -372,7 +776,7 @@ mod tests {
                 root,
                 Path::new("game/icon.png"),
                 &engine,
-                &Profile::default()
+                &ResolvedSettings::default()
             )?),
             "loaded outside image pipeline"
         );

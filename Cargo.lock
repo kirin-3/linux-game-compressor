@@ -247,9 +247,11 @@ dependencies = [
 name = "compressor-media"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "compressor-core",
  "compressor-test-fixtures",
  "image",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

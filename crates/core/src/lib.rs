@@ -6,13 +6,14 @@ pub mod journal;
 pub mod output;
 pub mod planning;
 pub mod process;
-pub mod profile;
 pub mod registry;
 pub mod scheduler;
+pub mod settings;
 pub mod tools;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
@@ -58,15 +59,150 @@ impl<'de> Deserialize<'de> for StoredPath {
 #[serde(rename_all = "snake_case")]
 pub enum MediaKind {
     Image,
+    Audio,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Profile {
-    pub name: String,
+pub struct ImageSettings {
     pub quality: u8,
     pub effort: u8,
     pub sharp_yuv: bool,
     pub reencode_webp: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AudioSettings {
+    pub opus_kbps_per_channel: u32,
+    pub vorbis_quality: u8,
+    pub mp3_kbps_per_channel: u32,
+}
+
+/// The complete image and audio defaults for a named built-in profile.
+pub fn builtin_settings(name: &str) -> Option<(ImageSettings, AudioSettings)> {
+    let (quality, effort, sharp_yuv, reencode_webp, opus, vorbis, mp3) = match name {
+        "balanced" => (82, 4, false, false, 48, 3, 64),
+        "quality" => (90, 6, true, false, 64, 5, 96),
+        "small" => (72, 6, false, true, 32, 1, 48),
+        _ => return None,
+    };
+    Some((
+        ImageSettings {
+            quality,
+            effort,
+            sharp_yuv,
+            reencode_webp,
+        },
+        AudioSettings {
+            opus_kbps_per_channel: opus,
+            vorbis_quality: vorbis,
+            mp3_kbps_per_channel: mp3,
+        },
+    ))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Resolved {
+    pub value: serde_json::Value,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedSettings {
+    pub profile: String,
+    pub values: BTreeMap<String, Resolved>,
+    pub engine_options: BTreeMap<String, Resolved>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OptionKind {
+    Enum(Vec<String>),
+    Bool,
+    Int { min: i64, max: i64 },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OptionSpec {
+    pub name: String,
+    pub kind: OptionKind,
+    pub default: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioCodec {
+    Opus,
+    Vorbis,
+    Mp3,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AudioProps {
+    pub channels: u32,
+    pub sample_rate: u32,
+    pub duration_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AudioEncode {
+    pub codec: AudioCodec,
+    pub bitrate_kbps: Option<u32>,
+    pub vorbis_quality: Option<u8>,
+    pub source: AudioProps,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConvertSettings {
+    Image(ImageSettings),
+    Audio(AudioEncode),
+}
+
+impl ResolvedSettings {
+    pub fn audio(&self) -> AudioSettings {
+        let get = |key: &str| {
+            self.values
+                .get(key)
+                .expect("resolved audio setting")
+                .value
+                .clone()
+        };
+        AudioSettings {
+            opus_kbps_per_channel: serde_json::from_value(get("audio.opus_kbps_per_channel"))
+                .expect("validated opus bitrate"),
+            vorbis_quality: serde_json::from_value(get("audio.vorbis_quality"))
+                .expect("validated vorbis quality"),
+            mp3_kbps_per_channel: serde_json::from_value(get("audio.mp3_kbps_per_channel"))
+                .expect("validated mp3 bitrate"),
+        }
+    }
+    pub fn image(&self) -> ImageSettings {
+        let get = |key: &str| {
+            self.values
+                .get(key)
+                .expect("resolved image setting")
+                .value
+                .clone()
+        };
+        ImageSettings {
+            quality: serde_json::from_value(get("image.quality")).expect("validated quality"),
+            effort: serde_json::from_value(get("image.effort")).expect("validated effort"),
+            sharp_yuv: serde_json::from_value(get("image.sharp_yuv")).expect("validated sharp_yuv"),
+            reencode_webp: serde_json::from_value(get("image.reencode_webp"))
+                .expect("validated reencode_webp"),
+        }
+    }
+}
+
+impl Default for ResolvedSettings {
+    fn default() -> Self {
+        settings::resolve(
+            None,
+            &[],
+            "default",
+            &BTreeMap::from([("default".into(), vec![])]),
+        )
+        .expect("built-in settings are valid")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +219,7 @@ pub struct EngineInfo {
 pub struct ToolSpec {
     pub name: String,
     pub package: String,
+    pub features: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -92,7 +229,7 @@ pub enum Action {
         kind: MediaKind,
         target: String,
         encoder: String,
-        settings: Profile,
+        settings: ConvertSettings,
     },
     Copy {
         reason: String,
@@ -115,7 +252,7 @@ pub struct Plan {
     pub plan_version: u32,
     pub input_root: StoredPath,
     pub engine: EngineInfo,
-    pub profile: Profile,
+    pub settings: ResolvedSettings,
     pub tools: Vec<ToolSpec>,
     pub entries: Vec<Entry>,
 }
@@ -142,20 +279,97 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
 
     #[test]
-    fn plan_round_trips_paths_and_actions() {
-        let profile = Profile {
-            name: "balanced".into(),
+    fn builtins_set_every_image_and_audio_key() {
+        for (name, image, audio) in [
+            ("balanced", (82, 4, false, false), (48, 3, 64)),
+            ("quality", (90, 6, true, false), (64, 5, 96)),
+            ("small", (72, 6, false, true), (32, 1, 48)),
+        ] {
+            let (i, a) = builtin_settings(name).unwrap();
+            assert_eq!((i.quality, i.effort, i.sharp_yuv, i.reencode_webp), image);
+            assert_eq!(
+                (
+                    a.opus_kbps_per_channel,
+                    a.vorbis_quality,
+                    a.mp3_kbps_per_channel
+                ),
+                audio
+            );
+        }
+        assert!(builtin_settings("unknown").is_none());
+    }
+
+    #[test]
+    fn settings_types_round_trip() {
+        fn round_trip<T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(
+            value: T,
+        ) {
+            assert_eq!(
+                serde_json::from_str::<T>(&serde_json::to_string(&value).unwrap()).unwrap(),
+                value
+            );
+        }
+        let image = ImageSettings {
             quality: 82,
             effort: 4,
             sharp_yuv: false,
             reencode_webp: false,
         };
+        let audio = AudioSettings {
+            opus_kbps_per_channel: 48,
+            vorbis_quality: 3,
+            mp3_kbps_per_channel: 64,
+        };
+        let props = AudioProps {
+            channels: 2,
+            sample_rate: 44100,
+            duration_ms: 1000,
+        };
+        let encode = AudioEncode {
+            codec: AudioCodec::Opus,
+            bitrate_kbps: Some(96),
+            vorbis_quality: None,
+            source: props.clone(),
+        };
+        let resolved = Resolved {
+            value: serde_json::json!(82),
+            source: "balanced".into(),
+        };
+        round_trip(image.clone());
+        round_trip(audio);
+        round_trip(props);
+        round_trip(encode.clone());
+        round_trip(resolved.clone());
+        round_trip(ResolvedSettings {
+            profile: "balanced".into(),
+            values: BTreeMap::from([("image.quality".into(), resolved)]),
+            engine_options: BTreeMap::new(),
+        });
+        for kind in [
+            OptionKind::Enum(vec!["opus".into(), "vorbis".into()]),
+            OptionKind::Bool,
+            OptionKind::Int { min: 0, max: 10 },
+        ] {
+            round_trip(OptionSpec {
+                name: "option".into(),
+                kind,
+                default: serde_json::json!(true),
+            });
+        }
+        round_trip(ConvertSettings::Image(image));
+        round_trip(ConvertSettings::Audio(encode));
+        round_trip(MediaKind::Audio);
+    }
+
+    #[test]
+    fn plan_round_trips_paths_and_actions() {
+        let settings = ResolvedSettings::default();
         let paths = [
             PathBuf::from("game/café.png"),
             PathBuf::from(OsString::from_vec(b"game/invalid-\xff.png".to_vec())),
         ];
         let plan = Plan {
-            plan_version: 1,
+            plan_version: 2,
             input_root: StoredPath("/tmp/game".into()),
             engine: EngineInfo {
                 name: "Ren'Py".into(),
@@ -164,10 +378,11 @@ mod tests {
                 notes: vec![],
                 version_check_overridden: false,
             },
-            profile: profile.clone(),
+            settings: settings.clone(),
             tools: vec![ToolSpec {
                 name: "cwebp".into(),
                 package: "libwebp-utils".into(),
+                features: vec![],
             }],
             entries: vec![
                 Entry {
@@ -178,7 +393,7 @@ mod tests {
                         kind: MediaKind::Image,
                         target: "webp".into(),
                         encoder: "cwebp".into(),
-                        settings: profile,
+                        settings: ConvertSettings::Image(settings.image()),
                     },
                 },
                 Entry {
