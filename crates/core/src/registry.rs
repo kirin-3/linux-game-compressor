@@ -119,6 +119,22 @@ pub trait PackFormat: Send + Sync {
     ) -> io::Result<()>;
 }
 
+pub trait EnvelopeFormat: Send + Sync {
+    fn unwrap(&self, data: &[u8], params: &serde_json::Value) -> io::Result<Vec<u8>>;
+    fn wrap(&self, payload: &[u8], params: &serde_json::Value) -> io::Result<Vec<u8>>;
+}
+
+#[derive(Default)]
+pub struct EnvelopeRegistry(HashMap<String, Arc<dyn EnvelopeFormat>>);
+impl EnvelopeRegistry {
+    pub fn register(&mut self, format: &str, handler: Arc<dyn EnvelopeFormat>) {
+        self.0.insert(format.to_owned(), handler);
+    }
+    pub fn get(&self, format: &str) -> Option<Arc<dyn EnvelopeFormat>> {
+        self.0.get(format).cloned()
+    }
+}
+
 #[derive(Default)]
 pub struct PackRegistry(HashMap<String, Arc<dyn PackFormat>>);
 impl PackRegistry {

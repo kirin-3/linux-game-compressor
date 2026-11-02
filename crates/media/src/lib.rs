@@ -1,6 +1,7 @@
 //! Content-based image detection and WebP conversion.
 
 pub mod audio;
+pub mod video;
 pub mod webp;
 use std::{
     collections::BTreeMap,
@@ -32,6 +33,7 @@ pub fn summarize_file(
                 audio::Codec::Vorbis => "vorbis",
                 audio::Codec::Opus => "opus",
                 audio::Codec::Mp3 => "mp3",
+                audio::Codec::Flac => "flac",
             },
             Err(e)
                 if matches!(
@@ -39,7 +41,11 @@ pub fn summarize_file(
                     io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
                 ) =>
             {
-                "other"
+                if video::has_video_magic(path)? && video::probe(path).is_ok() {
+                    "video"
+                } else {
+                    "other"
+                }
             }
             Err(e) => return Err(e),
         },
@@ -68,7 +74,7 @@ pub fn detect_bytes(data: &[u8]) -> ImageFormat {
     detect_reader(&mut Cursor::new(data)).unwrap_or(ImageFormat::Unsupported)
 }
 
-fn detect_reader(reader: &mut (impl Read + Seek)) -> io::Result<ImageFormat> {
+pub fn detect_reader(reader: &mut (impl Read + Seek)) -> io::Result<ImageFormat> {
     let mut header = [0u8; 21];
     let mut count = 0;
     while count < header.len() {
@@ -172,7 +178,9 @@ mod tests {
             ("mislabelled.png", ImageFormat::Unsupported),
             ("BG.PNG", ImageFormat::Png),
         ] {
-            assert_eq!(detect(&images.join(name))?, expected, "{name}");
+            let path = images.join(name);
+            assert_eq!(detect(&path)?, expected, "{name}");
+            assert_eq!(detect_bytes(&std::fs::read(&path)?), expected, "{name}");
         }
         let mut animated = b"RIFF0000WEBPVP8X0000".to_vec();
         animated.push(2);

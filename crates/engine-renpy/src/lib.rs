@@ -142,7 +142,7 @@ impl EngineAdapter for RenpyAdapter {
         if ["rpa", "rpi"].contains(&ext.as_str()) {
             return Ok(copy("contents not processed"));
         }
-        if ["ogg", "opus", "mp3"].contains(&ext.as_str()) {
+        if ["ogg", "opus", "mp3", "flac"].contains(&ext.as_str()) {
             use compressor_core::{AudioCodec, AudioEncode, AudioProps, ConvertSettings};
             use compressor_media::audio::{self, Codec, Container};
             let info = match audio::sniff(&source) {
@@ -164,7 +164,7 @@ impl EngineAdapter for RenpyAdapter {
                 AudioCodec::Mp3
             } else if ext == "opus" {
                 AudioCodec::Opus
-            } else if ext == "ogg" {
+            } else if ext == "ogg" || (ext == "flac" && info.codec == Codec::Flac) {
                 if settings
                     .engine_options
                     .get("ogg_target")
@@ -206,6 +206,7 @@ impl EngineAdapter for RenpyAdapter {
                 kind: MediaKind::Audio,
                 target: container.into(),
                 encoder: "ffmpeg".into(),
+                envelope: None,
                 settings: ConvertSettings::Audio(AudioEncode {
                     codec: target.clone(),
                     bitrate_kbps: if target == AudioCodec::Vorbis {
@@ -288,6 +289,7 @@ impl EngineAdapter for RenpyAdapter {
                 kind: MediaKind::Image,
                 target: "webp".into(),
                 encoder: "cwebp".into(),
+                envelope: None,
                 settings: compressor_core::ConvertSettings::Image(settings.image()),
             },
             ImageFormat::Unsupported => skip("unsupported source format".into()),
@@ -385,6 +387,7 @@ mod tests {
             &["-c:a", "libvorbis", "-q:a", "5"],
         )?;
         generate_audio(&dir.join("flac.ogg"), 2, &["-c:a", "flac", "-f", "ogg"])?;
+        generate_audio(&dir.join("native.flac"), 2, &["-c:a", "flac"])?;
         generate_audio(
             &dir.join("sound.mp3"),
             2,
@@ -426,8 +429,12 @@ mod tests {
             reason(classify("surround.ogg", &settings)),
             "more than two channels"
         );
+        assert!(matches!(
+            classify("flac.ogg", &settings),
+            Action::Convert { .. }
+        ));
         assert_eq!(
-            reason(classify("flac.ogg", &settings)),
+            reason(classify("native.flac", &settings)),
             "unsupported audio format"
         );
         assert!(matches!(
@@ -463,6 +470,16 @@ mod tests {
             "renpy",
             &specs,
         )?;
+        assert!(matches!(
+            classify("flac.ogg", &vorbis),
+            Action::Convert {
+                settings: compressor_core::ConvertSettings::Audio(compressor_core::AudioEncode {
+                    codec: compressor_core::AudioCodec::Vorbis,
+                    ..
+                }),
+                ..
+            }
+        ));
         match classify("THEME.OGG", &vorbis) {
             Action::Convert {
                 settings: compressor_core::ConvertSettings::Audio(a),
@@ -761,7 +778,7 @@ mod tests {
             &output.path().join(".compressor/journal.jsonl"),
         )?;
         let plan = compressor_core::Plan {
-            plan_version: 3,
+            plan_version: 4,
             input_root: StoredPath(root.to_owned()),
             engine: engine.clone(),
             settings: ResolvedSettings::default(),

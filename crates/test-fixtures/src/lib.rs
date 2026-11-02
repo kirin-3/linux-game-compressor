@@ -167,6 +167,110 @@ pub fn godot_pack_members(members: &[(&str, &[u8])]) -> Vec<u8> {
     pack
 }
 
+/// Synthetic MV or MZ layout with encrypted image and audio assets.
+pub struct RpgMakerFixture {
+    _temp: TempDir,
+    root: PathBuf,
+    content: PathBuf,
+}
+impl RpgMakerFixture {
+    pub const KEY: [u8; 16] = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ];
+    pub fn new(mz: bool, with_key: bool) -> io::Result<Self> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("game");
+        let content = if mz { root.clone() } else { root.join("www") };
+        for dir in [
+            "js",
+            "data",
+            "img/pictures",
+            "img/parallaxes",
+            "audio/bgm",
+            "movies",
+        ] {
+            fs::create_dir_all(content.join(dir))?;
+        }
+        let (core, version) = if mz {
+            ("rmmz_core.js", "1.8.0")
+        } else {
+            ("rpg_core.js", "1.6.2")
+        };
+        fs::write(
+            content.join("js").join(core),
+            format!("Utils.RPGMAKER_VERSION = '{version}';\n"),
+        )?;
+        let key = if with_key {
+            ",\"encryptionKey\":\"00112233445566778899aabbccddeeff\""
+        } else {
+            ""
+        };
+        fs::write(
+            content.join("data/System.json"),
+            format!("{{\"hasEncryptedImages\":true,\"hasEncryptedAudio\":true{key}}}"),
+        )?;
+        let image_ext = if mz { "png_" } else { "rpgmvp" };
+        for folder in ["pictures", "parallaxes"] {
+            fs::write(
+                content.join(format!("img/{folder}/sample.{image_ext}")),
+                Self::encrypt(include_bytes!("../assets/opaque.png")),
+            )?;
+        }
+        for (ext, codec, format) in if mz {
+            [("ogg_", "libvorbis", "ogg"), ("m4a_", "aac", "ipod")]
+        } else {
+            [("rpgmvo", "libvorbis", "ogg"), ("rpgmvm", "aac", "ipod")]
+        } {
+            let plain = temp.path().join(format!("source.{format}"));
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anoisesrc=duration=1",
+                    "-c:a",
+                    codec,
+                    "-f",
+                    format,
+                    "-y",
+                ])
+                .arg(&plain)
+                .status()?;
+            if !status.success() {
+                return Err(io::Error::other("ffmpeg fixture generation failed"));
+            }
+            fs::write(
+                content.join(format!("audio/bgm/sample.{ext}")),
+                Self::encrypt(&fs::read(plain)?),
+            )?;
+        }
+        Ok(Self {
+            _temp: temp,
+            root,
+            content,
+        })
+    }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    pub fn content(&self) -> &Path {
+        &self.content
+    }
+    pub fn encrypt(payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() >= 16);
+        let mut result = b"RPGMV\0\0\0\0\x03\x01\0\0\0\0\0".to_vec();
+        result.extend(payload);
+        for (byte, key) in result[16..32].iter_mut().zip(Self::KEY) {
+            *byte ^= key;
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

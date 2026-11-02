@@ -11,7 +11,7 @@ use std::{
 };
 use walkdir::WalkDir;
 
-const PLAN_VERSION: u64 = 3;
+const PLAN_VERSION: u64 = 4;
 
 fn versioned_json(path: &Path, manifest: bool) -> io::Result<serde_json::Value> {
     let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
@@ -151,7 +151,7 @@ pub fn build_plan(
         }
     }
     Ok(Plan {
-        plan_version: 3,
+        plan_version: 4,
         input_root: StoredPath(root),
         engine,
         settings,
@@ -269,6 +269,7 @@ mod tests {
                     kind: crate::MediaKind::Image,
                     target: "webp".into(),
                     encoder: "fake".into(),
+                    envelope: None,
                     settings: crate::ConvertSettings::Image(settings.image()),
                 }
             } else {

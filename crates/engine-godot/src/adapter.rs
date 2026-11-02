@@ -227,6 +227,7 @@ fn classify_member(name: &str, bytes: &[u8], settings: &ResolvedSettings) -> Act
             kind: MediaKind::Image,
             target: "webp".into(),
             encoder: "godot-ctex".into(),
+            envelope: None,
             settings: ConvertSettings::Image(settings.image()),
         };
     }
@@ -329,6 +330,7 @@ fn classify_member(name: &str, bytes: &[u8], settings: &ResolvedSettings) -> Act
         }
         .into(),
         encoder: "godot-audio".into(),
+        envelope: None,
         settings: ConvertSettings::Audio(AudioEncode {
             codec: codec.clone(),
             bitrate_kbps: if codec == AudioCodec::Mp3 {

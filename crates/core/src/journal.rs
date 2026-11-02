@@ -144,6 +144,9 @@ pub fn resumable_records(
         if key.1.is_some() && rebuilt_packs.contains(&key.0) {
             return true;
         }
+        if record.outcome == "removed" && key.1.is_none() {
+            return !output.join(&key.0 .0).exists();
+        }
         match &record.output_hash {
             Some(hash) => hash_input(&if key.1.is_some() {
                 let index = plan
@@ -186,7 +189,7 @@ mod tests {
             failure: false,
         };
         let plan = Plan {
-            plan_version: 3,
+            plan_version: 4,
             input_root: StoredPath(temp.path().to_owned()),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -247,7 +250,7 @@ mod tests {
             })
             .collect();
         let plan = Plan {
-            plan_version: 3,
+            plan_version: 4,
             input_root: StoredPath(output.to_owned()),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -300,6 +303,13 @@ mod tests {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct Removal {
+    pub path: StoredPath,
+    pub reason: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Report {
     pub complete: bool,
     pub notes: Vec<String>,
@@ -308,6 +318,7 @@ pub struct Report {
     pub input_bytes: u64,
     pub output_bytes: u64,
     pub savings_by_media: BTreeMap<String, i128>,
+    pub removals: Vec<Removal>,
     pub skips: Vec<JournalEntry>,
     pub failures: Vec<JournalEntry>,
 }
@@ -352,6 +363,7 @@ pub fn build_report(manifest: &Manifest) -> Report {
         .map(|entry| display_path(&entry.path, entry.member.as_deref()))
         .collect();
     let mut savings_by_media = BTreeMap::new();
+    let mut removals = Vec::new();
     let mut skips = Vec::new();
     let mut failures = Vec::new();
     for record in &manifest.entries {
@@ -359,7 +371,10 @@ pub fn build_report(manifest: &Manifest) -> Report {
         display_record.path = display_path(&record.path, record.member.as_deref());
         if record.failure {
             failures.push(display_record);
-        } else if !record.outcome.starts_with("converted") && record.outcome != "rebuilt" {
+        } else if !record.outcome.starts_with("converted")
+            && record.outcome != "rebuilt"
+            && record.outcome != "removed"
+        {
             skips.push(display_record);
         }
         if let Some(entry) = manifest
@@ -368,6 +383,15 @@ pub fn build_report(manifest: &Manifest) -> Report {
             .iter()
             .find(|entry| entry.path == record.path && entry.member == record.member)
         {
+            if let crate::Action::Remove { reason } = &entry.action {
+                if record.outcome == "removed" {
+                    removals.push(Removal {
+                        path: display_path(&record.path, record.member.as_deref()),
+                        reason: reason.clone(),
+                        size: record.input_size,
+                    });
+                }
+            }
             let pack_failed = record.member.is_some()
                 && manifest
                     .entries
@@ -405,6 +429,7 @@ pub fn build_report(manifest: &Manifest) -> Report {
             .map(|e| e.output_size)
             .sum(),
         savings_by_media,
+        removals,
         skips,
         failures,
     }

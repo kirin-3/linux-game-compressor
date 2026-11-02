@@ -60,6 +60,7 @@ impl<'de> Deserialize<'de> for StoredPath {
 pub enum MediaKind {
     Image,
     Audio,
+    Video,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,6 +69,8 @@ pub struct ImageSettings {
     pub effort: u8,
     pub sharp_yuv: bool,
     pub reencode_webp: bool,
+    #[serde(default)]
+    pub lossless: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -91,6 +94,7 @@ pub fn builtin_settings(name: &str) -> Option<(ImageSettings, AudioSettings)> {
             effort,
             sharp_yuv,
             reencode_webp,
+            lossless: false,
         },
         AudioSettings {
             opus_kbps_per_channel: opus,
@@ -151,13 +155,52 @@ pub struct AudioEncode {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VideoSettings {
+    pub crf: u8,
+    pub effort: u8,
+    pub opus_kbps_per_channel: u32,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VideoProps {
+    pub width: u32,
+    pub height: u32,
+    pub fps: String,
+    pub duration_ms: u64,
+    pub alpha: bool,
+    pub audio_channels: Option<u32>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VideoEncode {
+    pub crf: u8,
+    pub cpu_used: u8,
+    pub opus_kbps: Option<u32>,
+    pub source: VideoProps,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConvertSettings {
     Image(ImageSettings),
     Audio(AudioEncode),
+    Video(VideoEncode),
 }
 
 impl ResolvedSettings {
+    pub fn video(&self) -> VideoSettings {
+        let get = |key: &str| {
+            self.values
+                .get(key)
+                .expect("resolved video setting")
+                .value
+                .clone()
+        };
+        VideoSettings {
+            crf: serde_json::from_value(get("video.crf")).expect("validated crf"),
+            effort: serde_json::from_value(get("video.effort")).expect("validated effort"),
+            opus_kbps_per_channel: serde_json::from_value(get("video.opus_kbps_per_channel"))
+                .expect("validated bitrate"),
+        }
+    }
     pub fn audio(&self) -> AudioSettings {
         let get = |key: &str| {
             self.values
@@ -189,6 +232,7 @@ impl ResolvedSettings {
             sharp_yuv: serde_json::from_value(get("image.sharp_yuv")).expect("validated sharp_yuv"),
             reencode_webp: serde_json::from_value(get("image.reencode_webp"))
                 .expect("validated reencode_webp"),
+            lossless: false,
         }
     }
 }
@@ -223,6 +267,12 @@ pub struct ToolSpec {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Envelope {
+    pub format: String,
+    pub params: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
     Rebuild {
@@ -233,6 +283,11 @@ pub enum Action {
         target: String,
         encoder: String,
         settings: ConvertSettings,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        envelope: Option<Envelope>,
+    },
+    Remove {
+        reason: String,
     },
     Copy {
         reason: String,
@@ -318,6 +373,7 @@ mod tests {
             effort: 4,
             sharp_yuv: false,
             reencode_webp: false,
+            lossless: false,
         };
         let audio = AudioSettings {
             opus_kbps_per_channel: 48,
@@ -373,7 +429,7 @@ mod tests {
             PathBuf::from(OsString::from_vec(b"game/invalid-\xff.png".to_vec())),
         ];
         let plan = Plan {
-            plan_version: 3,
+            plan_version: 4,
             input_root: StoredPath("/tmp/game".into()),
             engine: EngineInfo {
                 name: "Ren'Py".into(),
@@ -398,6 +454,7 @@ mod tests {
                         kind: MediaKind::Image,
                         target: "webp".into(),
                         encoder: "cwebp".into(),
+                        envelope: None,
                         settings: ConvertSettings::Image(settings.image()),
                     },
                 },
@@ -408,6 +465,15 @@ mod tests {
                     hash: "def".into(),
                     action: Action::Skip {
                         reason: "test".into(),
+                    },
+                },
+                Entry {
+                    path: StoredPath("unused.m4a".into()),
+                    member: None,
+                    size: 5,
+                    hash: "remove".into(),
+                    action: Action::Remove {
+                        reason: "unused on desktop".into(),
                     },
                 },
                 Entry {

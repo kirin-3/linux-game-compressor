@@ -24,13 +24,20 @@ impl WebpTransformer {
             "-metadata".into(),
             "none".into(),
             "-q".into(),
-            settings.quality.to_string().into(),
+            if settings.lossless {
+                "100".into()
+            } else {
+                settings.quality.to_string().into()
+            },
             "-m".into(),
             settings.effort.to_string().into(),
             "-alpha_q".into(),
             "100".into(),
         ];
-        if settings.sharp_yuv {
+        if settings.lossless {
+            args.push("-lossless".into());
+        }
+        if settings.sharp_yuv && !settings.lossless {
             args.push("-sharp_yuv".into());
         }
         args.extend([
@@ -151,12 +158,13 @@ impl Transformer for WebpTransformer {
         force: &'a CancellationToken,
     ) -> Operation<'a, ()> {
         Box::pin(async move {
-            if !matches!(settings, ConvertSettings::Image(_)) {
+            let ConvertSettings::Image(image) = settings else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "expected image settings",
                 ));
-            }
+            };
+            let lossless = image.lossless;
             if matches!(
                 crate::detect(source)?,
                 crate::ImageFormat::AnimatedPng | crate::ImageFormat::AnimatedWebp
@@ -184,14 +192,16 @@ impl Transformer for WebpTransformer {
             let source = source.to_owned();
             let output = output.to_owned();
             let pam_path = pam.path().to_owned();
-            tokio::task::spawn_blocking(move || validate_decoded(&source, &output, &pam_path))
-                .await
-                .map_err(io::Error::other)?
+            tokio::task::spawn_blocking(move || {
+                validate_decoded(&source, &output, &pam_path, lossless)
+            })
+            .await
+            .map_err(io::Error::other)?
         })
     }
 }
 
-fn validate_decoded(source: &Path, output: &Path, pam: &Path) -> io::Result<()> {
+fn validate_decoded(source: &Path, output: &Path, pam: &Path, lossless: bool) -> io::Result<()> {
     let source = image::ImageReader::open(source)?
         .with_guessed_format()?
         .decode()
@@ -226,6 +236,15 @@ fn validate_decoded(source: &Path, output: &Path, pam: &Path) -> io::Result<()> 
         || width.checked_mul(height).and_then(|n| n.checked_mul(depth)) != Some(bytes.len() - end)
     {
         return Err(io::Error::other("decode failed: invalid PAM data"));
+    }
+    if lossless {
+        for (index, pixel) in source.pixels().enumerate() {
+            let result = &bytes[end + index * depth..end + (index + 1) * depth];
+            let alpha = if depth == 4 { result[3] } else { 255 };
+            if pixel[3] != alpha || (pixel[3] != 0 && pixel.0[..3] != result[..3]) {
+                return Err(io::Error::other("pixels changed"));
+            }
+        }
     }
     let transparent = source.pixels().any(|p| p[3] < 255);
     if transparent && !webp_has_alpha(output)? {
@@ -291,6 +310,7 @@ mod tests {
             effort: 6,
             sharp_yuv: true,
             reencode_webp: false,
+            lossless: false,
         };
         let args =
             WebpTransformer::arguments(Path::new("/game/-a.png"), Path::new("/tmp/out.webp"), &p)
@@ -320,6 +340,42 @@ mod tests {
             WebpTransformer::arguments(Path::new("relative"), Path::new("/tmp/out.webp"), &p)
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn lossless_checks_visible_pixels_and_legacy_settings() -> io::Result<()> {
+        let fixture = compressor_test_fixtures::Fixture::new()?;
+        let source = fixture.root().join("game/images/sprite transparent.png");
+        let dir = tempfile::tempdir()?;
+        let output = dir.path().join("out.webp");
+        let mut image_settings = compressor_core::ResolvedSettings::default().image();
+        let legacy = serde_json::to_value(&image_settings)?;
+        let mut legacy = legacy.as_object().unwrap().clone();
+        legacy.remove("lossless");
+        assert!(!serde_json::from_value::<ImageSettings>(legacy.into())?.lossless);
+        image_settings.lossless = true;
+        let settings = ConvertSettings::Image(image_settings);
+        let token = CancellationToken::new();
+        WebpTransformer
+            .transform(&source, &output, &settings, &token)
+            .await?;
+        WebpTransformer
+            .validate(&source, &output, &settings, &token)
+            .await?;
+        let mut altered = image::open(&source).map_err(io::Error::other)?.into_rgba8();
+        let pixel = altered.pixels_mut().find(|p| p[3] != 0).unwrap();
+        pixel[0] ^= 1;
+        let changed = dir.path().join("changed.png");
+        altered.save(&changed).map_err(io::Error::other)?;
+        WebpTransformer
+            .transform(&changed, &output, &settings, &token)
+            .await?;
+        assert!(WebpTransformer
+            .validate(&source, &output, &settings, &token)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("pixels changed"));
+        Ok(())
     }
     #[tokio::test]
     async fn validator_checks_dimensions_decode_and_transparency() -> io::Result<()> {
@@ -418,7 +474,7 @@ mod tests {
         assert!(std::fs::metadata(&converted)?.len() >= std::fs::metadata(&source)?.len());
         let (size, hash) = compressor_core::planning::hash_input(&source)?;
         let plan = Plan {
-            plan_version: 3,
+            plan_version: 4,
             input_root: StoredPath(source_dir.canonicalize()?),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -438,6 +494,7 @@ mod tests {
                     kind: MediaKind::Image,
                     target: "webp".into(),
                     encoder: "cwebp".into(),
+                    envelope: None,
                     settings: profile,
                 },
             }],

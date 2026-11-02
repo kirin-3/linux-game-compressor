@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use compressor_core::{
-    job::{run_job_with_packs, Event},
+    job::{run_job_with_envelopes, Event},
     planning::{build_plan, hash_input, validate_plan},
-    registry::{EngineRegistry, PackRegistry, TransformerRegistry},
+    registry::{EngineRegistry, EnvelopeRegistry, PackRegistry, TransformerRegistry},
     Action, Plan,
 };
 use compressor_engine_renpy::RenpyAdapter;
@@ -83,6 +83,10 @@ fn registry() -> TransformerRegistry {
     r.register("cwebp", Arc::new(WebpTransformer));
     r.register("ffmpeg", Arc::new(AudioTransformer));
     r.register(
+        "ffmpeg-video",
+        Arc::new(compressor_media::video::VideoTransformer),
+    );
+    r.register(
         "godot-ctex",
         Arc::new(compressor_engine_godot::texture_transform::GodotTextureTransformer),
     );
@@ -98,6 +102,7 @@ fn engine_registry(allow: bool) -> EngineRegistry {
         allow_unknown_version: allow,
     }));
     engines.register(Arc::new(compressor_engine_godot::adapter::GodotAdapter));
+    engines.register(Arc::new(compressor_engine_rpgm::RpgMakerAdapter::default()));
     engines
 }
 fn pack_registry() -> PackRegistry {
@@ -107,6 +112,14 @@ fn pack_registry() -> PackRegistry {
         Arc::new(compressor_engine_godot::GodotPackFormat),
     );
     packs
+}
+fn envelope_registry() -> EnvelopeRegistry {
+    let mut registry = EnvelopeRegistry::default();
+    registry.register(
+        "rpgmaker",
+        Arc::new(compressor_engine_rpgm::RpgMakerEnvelope),
+    );
+    registry
 }
 fn engine_specs(engines: &EngineRegistry) -> BTreeMap<String, Vec<compressor_core::OptionSpec>> {
     engines
@@ -138,6 +151,7 @@ fn plan_counts(plan: &Plan) -> BTreeMap<String, usize> {
     for entry in &plan.entries {
         let key = match &entry.action {
             Action::Convert { .. } => "convert".to_owned(),
+            Action::Remove { reason } => format!("remove: {reason}"),
             Action::Copy { reason } => format!("copy: {reason}"),
             Action::Skip { reason } => format!("skip: {reason}"),
             Action::Rebuild { format } => format!("rebuild: {format}"),
@@ -210,8 +224,76 @@ fn inspect_packs(root: &Path) -> io::Result<Vec<PackInfo>> {
     Ok(result)
 }
 #[derive(serde::Serialize)]
+struct RpgMakerInfo {
+    content_root: compressor_core::StoredPath,
+    encrypted_images: bool,
+    encrypted_audio: bool,
+    key_source: String,
+    encrypted_count: u64,
+    encrypted_bytes: u64,
+    video_count: u64,
+    video_bytes: u64,
+}
+fn inspect_rpgmaker(plan: &Plan) -> io::Result<Option<RpgMakerInfo>> {
+    if !plan.engine.name.starts_with("RPG Maker ") {
+        return Ok(None);
+    }
+    let root = &plan.input_root.0;
+    let content = if root.join("www/data/System.json").is_file() {
+        Path::new("www")
+    } else {
+        Path::new("")
+    };
+    let system: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(content).join("data/System.json"))?)?;
+    let mut info = RpgMakerInfo {
+        content_root: compressor_core::StoredPath(content.to_owned()),
+        encrypted_images: system["hasEncryptedImages"].as_bool().unwrap_or(false),
+        encrypted_audio: system["hasEncryptedAudio"].as_bool().unwrap_or(false),
+        key_source: plan
+            .engine
+            .notes
+            .iter()
+            .find(|s| s.starts_with("key ") || s.as_str() == "encryption key not found")
+            .cloned()
+            .unwrap_or_default(),
+        encrypted_count: 0,
+        encrypted_bytes: 0,
+        video_count: 0,
+        video_bytes: 0,
+    };
+    for entry in &plan.entries {
+        if entry.member.is_some() {
+            continue;
+        }
+        let Ok(local) = entry.path.0.strip_prefix(content) else {
+            continue;
+        };
+        let extension = local
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(
+            extension.as_str(),
+            "rpgmvp" | "rpgmvo" | "rpgmvm" | "png_" | "ogg_" | "m4a_"
+        ) {
+            info.encrypted_count += 1;
+            info.encrypted_bytes += entry.size;
+        }
+        if (local.starts_with("movies") || local.starts_with("videos"))
+            && compressor_media::video::has_video_magic(&root.join(&entry.path.0)).unwrap_or(false)
+        {
+            info.video_count += 1;
+            info.video_bytes += entry.size;
+        }
+    }
+    Ok(Some(info))
+}
+#[derive(serde::Serialize)]
 struct InspectResult {
     engine: compressor_core::EngineInfo,
+    rpgmaker: Option<RpgMakerInfo>,
     media: BTreeMap<String, MediaCount>,
     archives: Vec<(String, u64)>,
     packs: Vec<PackInfo>,
@@ -220,6 +302,7 @@ struct InspectResult {
 }
 fn inspect(game: &Path) -> io::Result<InspectResult> {
     let plan = new_plan(game, None, &[], false)?;
+    let rpgmaker = inspect_rpgmaker(&plan)?;
     let mut media = BTreeMap::<String, MediaCount>::new();
     let mut archives = Vec::new();
     for entry in &plan.entries {
@@ -243,8 +326,30 @@ fn inspect(game: &Path) -> io::Result<InspectResult> {
         }
         compressor_media::summarize_file(&mut media, &path, entry.size)?;
     }
-    let tools = plan
-        .tools
+    let mut inspected_tools = plan.tools.clone();
+    if rpgmaker.as_ref().is_some_and(|r| r.video_count > 0) {
+        let tool = inspected_tools.iter_mut().find(|t| t.name == "ffmpeg");
+        let features = [
+            "libvpx-vp9",
+            "libopus",
+            "decoder:libvpx",
+            "decoder:libvpx-vp9",
+        ];
+        if let Some(tool) = tool {
+            for feature in features {
+                if !tool.features.iter().any(|f| f == feature) {
+                    tool.features.push(feature.into());
+                }
+            }
+        } else {
+            inspected_tools.push(compressor_core::ToolSpec {
+                name: "ffmpeg".into(),
+                package: "ffmpeg".into(),
+                features: features.into_iter().map(str::to_owned).collect(),
+            });
+        }
+    }
+    let tools = inspected_tools
         .iter()
         .map(|tool| {
             let mut p = plan.clone();
@@ -280,6 +385,7 @@ fn inspect(game: &Path) -> io::Result<InspectResult> {
         .collect();
     Ok(InspectResult {
         engine: plan.engine,
+        rpgmaker,
         media,
         archives,
         packs: inspect_packs(game)?,
@@ -379,6 +485,24 @@ async fn run(cli: Cli) -> io::Result<i32> {
                     result.engine.name,
                     result.engine.version.as_deref().unwrap_or("unknown")
                 );
+                if let Some(rpg) = &result.rpgmaker {
+                    println!(
+                        "RPG Maker content root: {}",
+                        if rpg.content_root.0.as_os_str().is_empty() {
+                            ".".into()
+                        } else {
+                            rpg.content_root.0.display().to_string()
+                        }
+                    );
+                    println!(
+                        "Encryption: images {}, audio {}; {}",
+                        rpg.encrypted_images, rpg.encrypted_audio, rpg.key_source
+                    );
+                    println!(
+                        "Encrypted: {} files, {} bytes; video: {} files, {} bytes",
+                        rpg.encrypted_count, rpg.encrypted_bytes, rpg.video_count, rpg.video_bytes
+                    );
+                }
                 for (name, count) in result.media {
                     println!("{name}: {} files, {} bytes", count.count, count.bytes);
                 }
@@ -441,6 +565,17 @@ async fn run(cli: Cli) -> io::Result<i32> {
                 for (kind, count) in plan_counts(&plan) {
                     println!("{kind}: {count}");
                 }
+                let mut removals = BTreeMap::<String, (usize, u64)>::new();
+                for entry in &plan.entries {
+                    if let Action::Remove { reason } = &entry.action {
+                        let row = removals.entry(reason.clone()).or_default();
+                        row.0 += 1;
+                        row.1 += entry.size;
+                    }
+                }
+                for (reason, (count, bytes)) in removals {
+                    println!("remove: {count} files, {bytes} bytes ({reason})");
+                }
                 println!(
                     "packs rebuilt: {}",
                     plan.entries
@@ -484,6 +619,7 @@ async fn run(cli: Cli) -> io::Result<i32> {
                     };
                     let action = match &entry.action {
                         Action::Convert { .. } => "convert".to_owned(),
+                        Action::Remove { reason } => format!("remove: {reason}"),
                         Action::Copy { reason } => format!("copy: {reason}"),
                         Action::Skip { reason } => format!("skip: {reason}"),
                         Action::Rebuild { format } => format!("rebuild: {format}"),
@@ -610,11 +746,12 @@ async fn run(cli: Cli) -> io::Result<i32> {
                     force_signal.cancel();
                 }
             });
-            let result = run_job_with_packs(
+            let result = run_job_with_envelopes(
                 &plan,
                 &output,
                 &registry(),
                 &pack_registry(),
+                &envelope_registry(),
                 jobs,
                 token,
                 force,
@@ -679,6 +816,15 @@ async fn verify(output: &Path) -> io::Result<VerifyResult> {
     }
     let mut directories = std::collections::HashMap::new();
     for entry in &manifest.entries {
+        if entry.outcome == "removed" && entry.member.is_none() {
+            result.checked += 1;
+            if std::fs::symlink_metadata(output.join(&entry.path.0)).is_ok() {
+                result
+                    .errors
+                    .push(format!("{}: removed file exists", entry.path.0.display()));
+            }
+            continue;
+        }
         let Some(hash) = &entry.output_hash else {
             continue;
         };
@@ -795,6 +941,60 @@ async fn verify(output: &Path) -> io::Result<VerifyResult> {
                 .find(|planned| planned.path == entry.path)
                 .map(|planned| &planned.action);
             let checked = match action {
+                Some(Action::Convert {
+                    encoder,
+                    settings,
+                    envelope: Some(envelope),
+                    ..
+                }) => {
+                    match (
+                        registry().get(encoder),
+                        envelope_registry().get(&envelope.format),
+                    ) {
+                        (Some(transformer), Some(handler)) => {
+                            let source =
+                                std::fs::read(manifest.plan.input_root.0.join(&entry.path.0))
+                                    .and_then(|b| handler.unwrap(&b, &envelope.params));
+                            let result_bytes = std::fs::read(&path)
+                                .and_then(|b| handler.unwrap(&b, &envelope.params));
+                            match (source, result_bytes) {
+                                (Ok(source), Ok(result_bytes)) => {
+                                    let input_temp = tempfile::NamedTempFile::new()?;
+                                    let output_temp = tempfile::NamedTempFile::new()?;
+                                    std::fs::write(input_temp.path(), source)?;
+                                    std::fs::write(output_temp.path(), result_bytes)?;
+                                    transformer
+                                        .validate(
+                                            input_temp.path(),
+                                            output_temp.path(),
+                                            settings,
+                                            &CancellationToken::new(),
+                                        )
+                                        .await
+                                }
+                                (Err(e), _) | (_, Err(e)) => Err(e),
+                            }
+                        }
+                        _ => Err(io::Error::other("missing transformer or envelope")),
+                    }
+                }
+                Some(Action::Convert {
+                    encoder,
+                    settings: settings @ compressor_core::ConvertSettings::Video(_),
+                    ..
+                }) => match registry().get(encoder) {
+                    Some(transformer) => {
+                        transformer
+                            .validate(
+                                &manifest.plan.input_root.0.join(&entry.path.0),
+                                &path,
+                                settings,
+                                &CancellationToken::new(),
+                            )
+                            .await
+                    }
+                    None => Err(io::Error::other("missing transformer")),
+                },
                 Some(Action::Convert {
                     settings: compressor_core::ConvertSettings::Image(_),
                     ..

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/media", "crates/engine-renpy", "crates/engine-godot", "crates/cli", "crates/test-fixtures"]
+members = ["crates/core", "crates/media", "crates/engine-renpy", "crates/engine-godot", "crates/engine-rpgm", "crates/cli", "crates/test-fixtures"]
 
 [workspace.package]
 edition = "2021"
@@ -11,6 +11,7 @@ compressor-core = { path = "crates/core" }
 compressor-media = { path = "crates/media" }
 compressor-engine-renpy = { path = "crates/engine-renpy" }
 compressor-engine-godot = { path = "crates/engine-godot" }
+compressor-engine-rpgm = { path = "crates/engine-rpgm" }
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

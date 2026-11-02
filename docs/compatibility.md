@@ -58,9 +58,9 @@ Steam initialization warning because no Steam client was installed.
 
 Ren'Py 6.99.9 added Opus playback to its default distributions, according to the [Ren'Py 6.99.9 changelog](https://www.renpy.org/doc/html/changelog6.html#ren-py-6-99-9). The compressor uses this as its minimum for Opus output; unknown or older versions fall back to Vorbis for `.ogg` files and skip `.opus` files unless the version check is overridden.
 
-Ren'Py Ogg Vorbis and Opus sources are encoded as Opus by default, or Vorbis
+Ren'Py Ogg Vorbis, Opus, and Ogg FLAC sources are encoded as Opus by default, or Vorbis
 when `ogg_target` is `vorbis`; MP3 sources remain MP3. Audio filenames and
-extensions are preserved. WAV, FLAC, and other unsupported formats are copied.
+extensions are preserved. WAV, native FLAC, and other unsupported formats are copied.
 Text tags, including Vorbis loop comments, are retained; embedded pictures are
 dropped and noted in the report. MP3 encoder delay and padding can shift loop
 points, so sample-exact MP3 loops are not guaranteed.
@@ -90,3 +90,26 @@ when their bitrate exceeds the profile target. Loop and beat properties are
 preserved. WAV and compressed binary resources are copied unchanged. MP3
 encoder delay and padding can shift loop points; sample-exact MP3 loops are
 not guaranteed.
+
+
+# RPG Maker MV and MZ
+
+MV and MZ exports are detected from their core script and `data/System.json`,
+at the root or under `www/`. Built-in encrypted images and audio remain encrypted
+under their original names. The key comes from `System.json` or is recovered
+from encrypted PNG headers; scripts and `System.json` are copied unchanged.
+Games packed with Enigma Virtual Box are unsupported, as are RPG Maker XP,
+VX Ace and earlier engines, browser-only deployments, and APKs.
+
+Images in `img/` become WebP; `img/parallaxes/` uses lossless WebP. Icons and
+Effekseer textures are copied. Ogg Vorbis and Ogg FLAC in `audio/` become
+Vorbis, preserving loop tags; MP3 stays MP3. M4A twins and, for MZ, MV-style
+leftovers with matching MZ twins are removed unless
+`engines.rpgmaker.remove_unused=false` is set.
+
+Videos in `movies/` or `videos/` become VP9/Opus WebM under their original
+names, even when those names end in `.mp4` or `.avi`. Transparency is retained.
+The bundled NW.js runtimes of the MV and MZ test games played every converted
+video to its end, including raw AVI and H.264 MP4 sources that the stock runtime
+could not play before conversion. Much older NW.js builds may lack VP9 or Opus
+support, so test video playback in such games before distributing the result.

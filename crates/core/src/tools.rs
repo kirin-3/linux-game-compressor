@@ -41,29 +41,49 @@ fn check_tools_with_path(tools: &[ToolSpec], path: &OsStr) -> io::Result<Vec<Too
                 tool.name, tool.package
             )));
         }
-        if !tool.features.is_empty() {
-            let encoders = Command::new(&executable)
-                .args(["-hide_banner", "-encoders"])
+        for decoder in [false, true] {
+            let selected: Vec<_> = tool
+                .features
+                .iter()
+                .filter_map(|feature| {
+                    if decoder {
+                        feature.strip_prefix("decoder:")
+                    } else if feature.starts_with("decoder:") {
+                        None
+                    } else {
+                        Some(feature.as_str())
+                    }
+                })
+                .collect();
+            if selected.is_empty() {
+                continue;
+            }
+            let kind = if decoder { "decoder" } else { "encoder" };
+            let listing = Command::new(&executable)
+                .args([
+                    "-hide_banner",
+                    if decoder { "-decoders" } else { "-encoders" },
+                ])
                 .stdin(Stdio::null())
                 .output()?;
-            if !encoders.status.success() {
+            if !listing.status.success() {
                 return Err(io::Error::other(format!(
-                    "{} from {} could not list encoders",
+                    "{} from {} could not list {kind}s",
                     tool.name, tool.package
                 )));
             }
-            let text = String::from_utf8_lossy(&encoders.stdout);
-            for feature in &tool.features {
+            let text = String::from_utf8_lossy(&listing.stdout);
+            for feature in selected {
                 let found = text.lines().any(|line| {
                     let mut parts = line.split_whitespace();
                     let flags = parts.next().unwrap_or("");
-                    flags.len() == 6 && parts.next() == Some(feature.as_str())
+                    flags.len() == 6 && parts.next() == Some(feature)
                 });
                 if !found {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
                         format!(
-                            "{} missing encoder {} (install {})",
+                            "{} missing {kind} {} (install {})",
                             tool.name, feature, tool.package
                         ),
                     ));
@@ -93,7 +113,7 @@ mod tests {
     fn empty_path_in_subprocess() -> io::Result<()> {
         if std::env::var_os("COMPRESSOR_EMPTY_PATH_TEST").is_some() {
             let plan = Plan {
-                plan_version: 3,
+                plan_version: 4,
                 input_root: StoredPath("/unused".into()),
                 engine: crate::EngineInfo {
                     name: "fake".into(),

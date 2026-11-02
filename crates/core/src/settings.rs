@@ -40,9 +40,12 @@ fn validate_value(
             format!("invalid value; allowed values: {allowed}"),
         ));
     }
+    let video = key.split('.').any(|part| part == "video");
     let bounds = match short {
         "quality" => Some((0, 100)),
+        "effort" if video => Some((0, 5)),
         "effort" => Some((0, 6)),
+        "crf" if video => Some((0, 63)),
         "vorbis_quality" => Some((0, 10)),
         "opus_kbps_per_channel" => Some((6, 256)),
         "mp3_kbps_per_channel" => Some((8, 160)),
@@ -105,6 +108,7 @@ fn section(path: &Path, prefix: &str, value: &toml::Value) -> io::Result<()> {
                 key.as_str(),
                 "quality" | "effort" | "sharp_yuv" | "reencode_webp"
             ),
+            Some("video") => matches!(key.as_str(), "crf" | "effort" | "opus_kbps_per_channel"),
             Some("audio") => matches!(
                 key.as_str(),
                 "opus_kbps_per_channel" | "vorbis_quality" | "mp3_kbps_per_channel"
@@ -140,7 +144,7 @@ pub fn parse_profile(
                     ));
                 }
             }
-            "image" | "audio" => section(path, key, value)?,
+            "image" | "audio" | "video" => section(path, key, value)?,
             "engines" => {
                 let entries = value
                     .as_table()
@@ -155,7 +159,7 @@ pub fn parse_profile(
                         .ok_or_else(|| invalid(path, &prefix, "must be a table"))?;
                     for (name, value) in entries {
                         let dotted = format!("{prefix}.{name}");
-                        if matches!(name.as_str(), "image" | "audio") {
+                        if matches!(name.as_str(), "image" | "audio" | "video") {
                             section(path, &dotted, value)?;
                         } else if options.iter().any(|o| o.name == *name) {
                             validate_value(path, &dotted, value, options)?;
@@ -208,11 +212,26 @@ pub fn resolve(
         values: BTreeMap::new(),
         engine_options: BTreeMap::new(),
     };
+    let (crf, effort, opus_kbps_per_channel) = match base.as_str() {
+        "balanced" => (36, 3, 48),
+        "quality" => (32, 4, 64),
+        "small" => (40, 3, 32),
+        _ => unreachable!(),
+    };
+    let video = crate::VideoSettings {
+        crf,
+        effort,
+        opus_kbps_per_channel,
+    };
     for (prefix, data) in [
+        ("video", serde_json::to_value(video).unwrap()),
         ("image", serde_json::to_value(image).unwrap()),
         ("audio", serde_json::to_value(audio).unwrap()),
     ] {
         for (key, value) in data.as_object().unwrap() {
+            if prefix == "image" && key == "lossless" {
+                continue;
+            }
             result.values.insert(
                 format!("{prefix}.{key}"),
                 Resolved {
@@ -260,12 +279,12 @@ pub fn resolve(
             .unwrap_or_else(|| toml::Value::String(raw.to_owned()));
         let parts: Vec<_> = key.split('.').collect();
         match parts.as_slice() {
-            [section_name @ ("image" | "audio"), name] => {
+            [section_name @ ("image" | "audio" | "video"), name] => {
                 let mut t = toml::Table::new();
                 t.insert((*name).into(), parsed.clone());
                 section(Path::new("--set"), section_name, &toml::Value::Table(t))?;
             }
-            ["engines", id, section_name @ ("image" | "audio"), name] => {
+            ["engines", id, section_name @ ("image" | "audio" | "video"), name] => {
                 if !engines.contains_key(*id) {
                     return Err(invalid(Path::new("--set"), key, unknown_engine(engines)));
                 }
@@ -325,6 +344,44 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn video_profiles_and_overrides() -> io::Result<()> {
+        let engines = BTreeMap::from([("rpgmaker".into(), vec![])]);
+        for (name, expected) in [
+            ("balanced", (36, 3, 48)),
+            ("quality", (32, 4, 64)),
+            ("small", (40, 3, 32)),
+        ] {
+            let video = resolve(Some(name), &[], "rpgmaker", &engines)?.video();
+            assert_eq!(
+                (video.crf, video.effort, video.opus_kbps_per_channel),
+                expected
+            );
+        }
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("profile.toml");
+        fs::write(
+            &path,
+            "[video]\ncrf = 33\n[engines.rpgmaker.video]\neffort = 5\n",
+        )?;
+        let result = resolve(
+            path.to_str(),
+            &["engines.rpgmaker.video.crf=34".into()],
+            "rpgmaker",
+            &engines,
+        )?;
+        assert_eq!((result.video().crf, result.video().effort), (34, 5));
+        assert!(resolve(None, &["video.crf=64".into()], "rpgmaker", &engines).is_err());
+        assert!(resolve(None, &["video.effort=6".into()], "rpgmaker", &engines).is_err());
+        assert!(resolve(
+            None,
+            &["video.opus_kbps_per_channel=5".into()],
+            "rpgmaker",
+            &engines
+        )
+        .is_err());
+        Ok(())
+    }
     #[test]
     fn bitrate_bounds_apply_to_profiles_and_overrides() {
         let engines = BTreeMap::from([("renpy".into(), vec![])]);

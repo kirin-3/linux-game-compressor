@@ -1,7 +1,7 @@
 # Game media compressor
 
-A Linux command-line tool for copying a Ren'Py or Godot 4 game to a separate
-directory while converting eligible images and audio to smaller, validated
+A Linux command-line tool for copying a Ren'Py, Godot 4, or RPG Maker MV/MZ game to a separate
+directory while converting eligible images, audio, and video to smaller, validated
 formats. Ren'Py archives are copied unchanged; Godot PCK packs are rebuilt
 when eligible members convert.
 
@@ -10,7 +10,7 @@ when eligible members convert.
 Install the libwebp command-line tools (`cwebp`, `dwebp`, and `webpinfo`). On
 Arch Linux and CachyOS the package is `libwebp-utils`; on Debian and Ubuntu it
 is `webp`. Install `ffmpeg` and `ffprobe` from the `ffmpeg` package with the
-`libopus`, `libvorbis`, and `libmp3lame` encoders needed by your plan. Install
+`libopus`, `libvorbis`, `libmp3lame`, and `libvpx-vp9` encoders needed by your plan; transparent video also needs the `libvpx` and `libvpx-vp9` decoders. Install
 Rust 1.88 or newer, then build with `cargo build --release`.
 The binary is `target/release/compressor`.
 
@@ -53,6 +53,14 @@ opus_kbps_per_channel = 48
 vorbis_quality = 3
 mp3_kbps_per_channel = 64
 
+[video]
+crf = 36
+effort = 3
+opus_kbps_per_channel = 48
+
+[engines.rpgmaker]
+remove_unused = true
+
 [engines.godot]
 min_texture_kib = 4
 
@@ -71,7 +79,16 @@ not converted. Any failed or non-smaller conversion keeps the original.
 Converted files retain their original names and extensions. Images contain
 WebP bytes; Ogg audio defaults to Opus unless `ogg_target` selects Vorbis,
 and MP3 remains MP3. Tools that assume extensions match content may not
-recognize converted files. WAV and FLAC are copied unchanged.
+recognize converted files. WAV and native FLAC are copied unchanged; Ogg FLAC is supported.
+
+For RPG Maker MV or MZ, the same commands preserve encrypted asset names and
+re-encrypt converted assets with the game key. Ogg audio remains Vorbis;
+unused M4A twins are removed by default. Disable that with
+`--set engines.rpgmaker.remove_unused=false`. Videos become VP9/Opus WebM
+under their original names, including `.mp4` or `.avi` names. Video settings
+are `video.crf` (0–63), `video.effort` (0–5), and
+`video.opus_kbps_per_channel` (6–256). See
+[compatibility](docs/compatibility.md#rpg-maker-mv-and-mz) for details.
 
 For a Godot 4 export, use the same `inspect`, `plan`, `compress`, and `verify`
 commands. Pack members are shown as `pack.pck::member`. Set the minimum

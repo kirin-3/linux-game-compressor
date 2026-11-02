@@ -7,6 +7,99 @@ pub enum ConversionOutcome {
     KeptOriginal { reason: String, failed: bool },
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn transform_enveloped(
+    source: PathBuf,
+    destination: PathBuf,
+    temporary: PathBuf,
+    settings: crate::ConvertSettings,
+    transformer: Arc<dyn crate::registry::Transformer>,
+    envelope: Arc<dyn crate::registry::EnvelopeFormat>,
+    params: serde_json::Value,
+    cancel: &CancellationToken,
+    force: &CancellationToken,
+) -> io::Result<ConversionOutcome> {
+    let plain = temporary.with_extension("payload.src");
+    let wrapped = temporary.with_extension("wrapped");
+    let original = tokio::fs::read(&source).await?;
+    let result: io::Result<ConversionOutcome> = async {
+        let payload = match envelope.unwrap(&original, &params) {
+            Ok(data) => data,
+            Err(e) => {
+                return Ok(ConversionOutcome::KeptOriginal {
+                    reason: format!("unwrap failed: {e}"),
+                    failed: true,
+                })
+            }
+        };
+        tokio::fs::write(&plain, payload).await?;
+        let note = match transformer
+            .transform_with_force(&plain, &temporary, &settings, cancel, force)
+            .await
+        {
+            Ok(note) => note,
+            Err(e) => {
+                return Ok(ConversionOutcome::KeptOriginal {
+                    reason: format!("encoder failed: {e}"),
+                    failed: true,
+                })
+            }
+        };
+        if let Err(e) = transformer
+            .validate_with_force(&plain, &temporary, &settings, cancel, force)
+            .await
+        {
+            return Ok(ConversionOutcome::KeptOriginal {
+                reason: format!("validation failed: {e}"),
+                failed: true,
+            });
+        }
+        let encoded = match tokio::fs::read(&temporary).await {
+            Ok(data) => data,
+            Err(e) => {
+                return Ok(ConversionOutcome::KeptOriginal {
+                    reason: format!("encoder produced no output: {e}"),
+                    failed: true,
+                })
+            }
+        };
+        let data = match envelope.wrap(&encoded, &params) {
+            Ok(data) => data,
+            Err(e) => {
+                return Ok(ConversionOutcome::KeptOriginal {
+                    reason: format!("wrap failed: {e}"),
+                    failed: true,
+                })
+            }
+        };
+        if data.len() >= original.len() {
+            return Ok(ConversionOutcome::KeptOriginal {
+                reason: "kept original: not smaller".into(),
+                failed: false,
+            });
+        }
+        tokio::fs::write(&wrapped, data).await?;
+        Ok(ConversionOutcome::Converted { note })
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&plain).await;
+    let _ = tokio::fs::remove_file(&temporary).await;
+    let outcome = result?;
+    if cancel.is_cancelled() {
+        let _ = tokio::fs::remove_file(&wrapped).await;
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
+    if matches!(outcome, ConversionOutcome::KeptOriginal { .. }) {
+        tokio::fs::write(&wrapped, original).await?;
+    }
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    crate::copy::preserve_metadata(&source, &wrapped)?;
+    tokio::fs::rename(&wrapped, destination).await?;
+    Ok(outcome)
+}
+
 #[cfg(test)]
 pub(crate) async fn transform_one(
     source: PathBuf,
@@ -239,6 +332,7 @@ mod tests {
                     kind: MediaKind::Image,
                     target: "webp".into(),
                     encoder: "fake".into(),
+                    envelope: None,
                     settings: crate::ConvertSettings::Image(
                         crate::ResolvedSettings::default().image(),
                     ),
@@ -246,7 +340,7 @@ mod tests {
             });
         }
         Ok(Plan {
-            plan_version: 3,
+            plan_version: 4,
             input_root: StoredPath(input),
             engine: EngineInfo {
                 name: "fake".into(),

@@ -17,7 +17,7 @@ fn incompatible_plans_and_manifests_do_not_change_output() -> io::Result<()> {
     let tmp = tempfile::tempdir()?;
     let plan = tmp.path().join("old-plan.json");
     let out = tmp.path().join("output");
-    std::fs::write(&plan, br#"{"plan_version":2}"#)?;
+    std::fs::write(&plan, br#"{"plan_version":3}"#)?;
     let args = [
         "compress",
         str_path(fixture.root()),
@@ -32,7 +32,7 @@ fn incompatible_plans_and_manifests_do_not_change_output() -> io::Result<()> {
     assert!(!out.exists());
     std::fs::create_dir_all(out.join(".compressor"))?;
     let manifest = out.join(".compressor/manifest.json");
-    let old = br#"{"plan":{"plan_version":2}}"#;
+    let old = br#"{"plan":{"plan_version":3}}"#;
     std::fs::write(&manifest, old)?;
     std::fs::write(out.join("keep"), b"unchanged")?;
     let result = command(&[
@@ -801,5 +801,200 @@ fn verifies_godot_member_and_reports_tampering() -> io::Result<()> {
     assert!(
         String::from_utf8_lossy(&result.stderr).contains("game.pck::texture.ctex: hash mismatch")
     );
+    Ok(())
+}
+
+#[test]
+fn inspect_rpgmaker_encryption_video_and_enigma() -> io::Result<()> {
+    let fixture = compressor_test_fixtures::RpgMakerFixture::new(false, true)?;
+    let video = fixture.content().join("movies/clip.mp4");
+    assert!(Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x48:rate=10:duration=1",
+            "-c:v",
+            "libx264",
+            "-y"
+        ])
+        .arg(&video)
+        .status()?
+        .success());
+    let result = command(&["inspect", str_path(fixture.root()), "--json"])?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+    assert_eq!(json["engine"]["name"], "RPG Maker MV");
+    assert_eq!(json["rpgmaker"]["content_root"], "www");
+    assert_eq!(json["rpgmaker"]["key_source"], "key from System.json");
+    assert_eq!(json["rpgmaker"]["video_count"], 1);
+    assert!(json["rpgmaker"]["encrypted_count"].as_u64().unwrap() >= 4);
+    assert!(json["tools"].to_string().contains("libvpx-vp9"));
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("Game.exe"), b"")?;
+    std::fs::write(dir.path().join("nw.dll"), b"")?;
+    std::fs::create_dir(dir.path().join("locales"))?;
+    let result = command(&["inspect", str_path(dir.path())])?;
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Enigma Virtual Box"));
+    Ok(())
+}
+
+#[test]
+fn plan_reports_removed_sizes_and_envelopes() -> io::Result<()> {
+    let fixture = compressor_test_fixtures::RpgMakerFixture::new(true, true)?;
+    let removed_size = std::fs::metadata(fixture.content().join("audio/bgm/sample.m4a_"))?.len();
+    let result = command(&["plan", str_path(fixture.root()), "--list"])?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let text = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        text.contains(&format!(
+            "remove: 1 files, {removed_size} bytes (unused on desktop)"
+        )),
+        "{text}"
+    );
+    assert!(text.contains("lossless: true"));
+    assert!(text.contains("rpgmaker"));
+    Ok(())
+}
+
+#[test]
+fn verify_checks_encrypted_conversions_removals_and_video() -> io::Result<()> {
+    let fixture = compressor_test_fixtures::RpgMakerFixture::new(true, true)?;
+    let temp = tempfile::tempdir()?;
+    let png = temp.path().join("large.png");
+    image::RgbaImage::from_pixel(512, 512, image::Rgba([15, 80, 200, 255]))
+        .save(&png)
+        .map_err(io::Error::other)?;
+    std::fs::write(
+        fixture.content().join("img/pictures/large.png_"),
+        compressor_test_fixtures::RpgMakerFixture::encrypt(&std::fs::read(png)?),
+    )?;
+    let video = fixture.content().join("movies/clip.avi");
+    assert!(Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=128x96:rate=10:duration=1",
+            "-c:v",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-y"
+        ])
+        .arg(&video)
+        .status()?
+        .success());
+    let out = temp.path().join("output");
+    let result = command(&[
+        "compress",
+        str_path(fixture.root()),
+        "--output",
+        str_path(&out),
+        "--jobs",
+        "1",
+    ])?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join(".compressor/manifest.json"))?)?;
+    let entries = manifest["entries"].as_array().unwrap();
+    for name in ["img/pictures/large.png_", "movies/clip.avi"] {
+        assert!(
+            entries.iter().any(|v| v["path"] == name
+                && v["outcome"].as_str().unwrap_or("").starts_with("converted")),
+            "{name}: {manifest}"
+        );
+    }
+    let verified = command(&["verify", str_path(&out)])?;
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    std::fs::write(out.join("audio/bgm/sample.m4a_"), b"restored")?;
+    let failed = command(&["verify", str_path(&out)])?;
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("removed file exists"));
+    Ok(())
+}
+
+#[test]
+fn documented_commands_run_against_rpgmaker_fixture() -> io::Result<()> {
+    let fixture = compressor_test_fixtures::RpgMakerFixture::new(true, true)?;
+    let temp = tempfile::tempdir()?;
+    let game = str_path(fixture.root());
+    let plan_path = temp.path().join("plan.json");
+    let out = temp.path().join("output");
+    let commands: Vec<Vec<&str>> = vec![
+        vec!["inspect", game],
+        vec!["inspect", game, "--json"],
+        vec![
+            "settings",
+            "--engine",
+            "renpy",
+            "--profile",
+            "small",
+            "--set",
+            "image.quality=70",
+        ],
+        vec!["settings", game, "--json"],
+        vec!["plan", game, "--profile", "balanced", "--list"],
+        vec![
+            "plan",
+            game,
+            "--profile",
+            "small",
+            "--set",
+            "audio.vorbis_quality=2",
+            "--save",
+            str_path(&plan_path),
+        ],
+        vec![
+            "compress",
+            game,
+            "--output",
+            str_path(&out),
+            "--plan",
+            str_path(&plan_path),
+            "--jobs",
+            "2",
+        ],
+        vec!["verify", str_path(&out)],
+        vec!["verify", str_path(&out), "--json"],
+        vec![
+            "plan",
+            game,
+            "--set",
+            "engines.godot.min_texture_kib=4",
+            "--list",
+        ],
+    ];
+    for args in commands {
+        let result = command(&args)?;
+        assert!(
+            result.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
     Ok(())
 }

@@ -278,6 +278,7 @@ pub enum Container {
 pub enum Codec {
     Vorbis,
     Opus,
+    Flac,
     Mp3,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -303,7 +304,7 @@ pub fn sniff_bytes(bytes: &[u8]) -> io::Result<AudioInfo> {
     sniff_reader(&mut io::Cursor::new(bytes))
 }
 
-fn sniff_reader<R: Read + Seek>(file: &mut R) -> io::Result<AudioInfo> {
+pub fn sniff_reader<R: Read + Seek>(file: &mut R) -> io::Result<AudioInfo> {
     let size = file.seek(SeekFrom::End(0))?;
     file.seek(SeekFrom::Start(0))?;
     let mut magic = [0; 4];
@@ -644,6 +645,18 @@ fn sniff_ogg<R: Read + Seek>(file: &mut R, size: u64) -> io::Result<AudioInfo> {
                 u32::from_le_bytes(identification[12..16].try_into().unwrap()),
                 0,
             )
+        } else if identification.starts_with(b"\x7fFLAC")
+            && identification.len() >= 35
+            && &identification[9..13] == b"fLaC"
+            && identification[13] & 0x7f == 0
+        {
+            let info = u64::from_be_bytes(identification[27..35].try_into().unwrap());
+            (
+                Codec::Flac,
+                ((info >> 41) & 7) as u32 + 1,
+                (info >> 44) as u32,
+                0,
+            )
         } else if identification.starts_with(b"OpusHead") && identification.len() >= 19 {
             (
                 Codec::Opus,
@@ -684,6 +697,65 @@ fn sniff_ogg<R: Read + Seek>(file: &mut R, size: u64) -> io::Result<AudioInfo> {
 mod tests {
     use super::*;
     use std::process::Command;
+    #[tokio::test]
+    async fn ogg_flac_sniffs_and_converts_with_loop_tag() -> io::Result<()> {
+        use compressor_core::{AudioEncode, AudioProps};
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("source.ogg");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anoisesrc=duration=2:sample_rate=44100",
+                "-ac",
+                "2",
+                "-metadata",
+                "LOOPSTART=1234",
+                "-c:a",
+                "flac",
+                "-f",
+                "ogg",
+                "-y",
+            ])
+            .arg(&source)
+            .status()?;
+        assert!(status.success());
+        let info = sniff(&source)?;
+        assert_eq!(info.codec, Codec::Flac);
+        assert_eq!(sniff_bytes(&std::fs::read(&source)?)?, info);
+        assert_eq!(
+            (info.channels, info.sample_rate, info.duration_ms),
+            (2, 44100, 2000)
+        );
+        let settings = ConvertSettings::Audio(AudioEncode {
+            codec: AudioCodec::Vorbis,
+            bitrate_kbps: None,
+            vorbis_quality: Some(3),
+            source: AudioProps {
+                channels: info.channels,
+                sample_rate: info.sample_rate,
+                duration_ms: info.duration_ms,
+            },
+        });
+        let output = dir.path().join("result.ogg");
+        let token = CancellationToken::new();
+        AudioTransformer
+            .transform(&source, &output, &settings, &token)
+            .await?;
+        AudioTransformer
+            .validate(&source, &output, &settings, &token)
+            .await?;
+        let tags = Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "stream_tags", "-of", "json"])
+            .arg(output)
+            .output()?;
+        assert!(String::from_utf8_lossy(&tags.stdout).contains("1234"));
+        Ok(())
+    }
     #[tokio::test]
     async fn encodes_each_codec_into_its_container() -> io::Result<()> {
         use compressor_core::{AudioEncode, AudioProps};
@@ -1146,10 +1218,7 @@ mod tests {
             .arg(&path)
             .status()?;
         assert!(status.success());
-        assert!(sniff(&path)
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported audio format"));
+        assert_eq!(sniff(&path)?.codec, Codec::Flac);
         Ok(())
     }
 }

@@ -208,6 +208,7 @@ dependencies = [
  "compressor-core",
  "compressor-engine-godot",
  "compressor-engine-renpy",
+ "compressor-engine-rpgm",
  "compressor-media",
  "compressor-test-fixtures",
  "image",
@@ -260,6 +261,19 @@ dependencies = [
 
 [[package]]
 name = "compressor-engine-renpy"
+version = "0.1.0"
+dependencies = [
+ "compressor-core",
+ "compressor-media",
+ "compressor-test-fixtures",
+ "regex",
+ "serde_json",
+ "tempfile",
+ "walkdir",
+]
+
+[[package]]
+name = "compressor-engine-rpgm"
 version = "0.1.0"
 dependencies = [
  "compressor-core",

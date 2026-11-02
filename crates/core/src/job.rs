@@ -3,7 +3,7 @@ use crate::{
     journal::{self, Journal, JournalEntry, Report},
     output::check_output,
     planning::{hash_input, validate_plan},
-    registry::{PackRegistry, TransformerRegistry},
+    registry::{EnvelopeRegistry, PackRegistry, TransformerRegistry},
     scheduler::{transform_one_with_force, ConversionOutcome},
     tools::check_tools,
     Action, Plan, StoredPath,
@@ -100,6 +100,32 @@ pub async fn run_job_with_packs(
     output: &Path,
     registry: &TransformerRegistry,
     packs: &PackRegistry,
+    jobs: usize,
+    cancel: CancellationToken,
+    force: CancellationToken,
+    events: broadcast::Sender<Event>,
+) -> io::Result<Report> {
+    run_job_with_envelopes(
+        plan,
+        output,
+        registry,
+        packs,
+        &EnvelopeRegistry::default(),
+        jobs,
+        cancel,
+        force,
+        events,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_job_with_envelopes(
+    plan: &Plan,
+    output: &Path,
+    registry: &TransformerRegistry,
+    packs: &PackRegistry,
+    envelopes: &EnvelopeRegistry,
     jobs: usize,
     cancel: CancellationToken,
     force: CancellationToken,
@@ -204,6 +230,18 @@ pub async fn run_job_with_packs(
             ),
             _ => None,
         };
+        let envelope = match &entry.action {
+            Action::Convert {
+                envelope: Some(envelope),
+                ..
+            } => Some((
+                envelopes.get(&envelope.format).ok_or_else(|| {
+                    io::Error::other(format!("missing envelope format: {}", envelope.format))
+                })?,
+                envelope.params.clone(),
+            )),
+            _ => None,
+        };
         let pack_member = entry.member.as_ref().map(|name| {
             let (handler, directory) = &pack_dirs[&entry.path];
             (
@@ -246,7 +284,11 @@ pub async fn run_job_with_packs(
                                 return Err(io::Error::new(io::ErrorKind::InvalidData, "stale pack member"));
                             }
                             tokio::fs::write(&source, bytes).await?;
-                            let result = transform_one_with_force(source.clone(), destination.clone(), temporary.clone(), settings.clone(), t, &token, &force).await;
+                            let result = if let Some((handler, params)) = envelope {
+                                crate::scheduler::transform_enveloped(source.clone(), destination.clone(), temporary.clone(), settings.clone(), t, handler, params, &token, &force).await
+                            } else {
+                                transform_one_with_force(source.clone(), destination.clone(), temporary.clone(), settings.clone(), t, &token, &force).await
+                            };
                             let _ = tokio::fs::remove_file(&source).await;
                             match result? {
                                 ConversionOutcome::Converted { note } => {
@@ -266,9 +308,19 @@ pub async fn run_job_with_packs(
                 } else {
                     let destination=output.join(&path.0); ensure_output_parent(&output, &path.0)?;
                     let (outcome, failure, exists) = match (&entry.action, transformer) {
-                        (Action::Convert { settings, .. }, Some(t)) => match transform_one_with_force(root.join(&path.0), destination.clone(), temporary.clone(), settings.clone(), t, &token, &force).await? {
+                        (Action::Convert { settings, .. }, Some(t)) => match if let Some((handler, params)) = envelope {
+                            crate::scheduler::transform_enveloped(root.join(&path.0), destination.clone(), temporary.clone(), settings.clone(), t, handler, params, &token, &force).await?
+                        } else { transform_one_with_force(root.join(&path.0), destination.clone(), temporary.clone(), settings.clone(), t, &token, &force).await? } {
                             ConversionOutcome::Converted { note } => (note.map_or_else(|| "converted".to_owned(), |n| format!("converted; {n}")), false, true),
                             ConversionOutcome::KeptOriginal { reason, failed } => (reason, failed, true),
+                        },
+                        (Action::Remove { .. }, _) => {
+                            match tokio::fs::remove_file(&destination).await {
+                                Ok(()) => {},
+                                Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+                                Err(e) => return Err(e),
+                            }
+                            ("removed".to_owned(), false, false)
                         },
                         (Action::Copy { reason } | Action::Skip { reason }, _) => match copy::stage_copy_entry(&root, &output, &path.0, &temporary)? {
                             CopyOutcome::Copied => { if token.is_cancelled() { return Err(io::Error::new(io::ErrorKind::Interrupted,"cancelled")); } tokio::fs::rename(&temporary, &destination).await?; (reason.clone(), false, true) },
@@ -548,6 +600,7 @@ mod tests {
                     kind: MediaKind::Image,
                     target: "webp".into(),
                     encoder: "fake".into(),
+                    envelope: None,
                     settings: crate::ConvertSettings::Image(profile.image()),
                 })
             } else {
@@ -596,6 +649,130 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
     }
+    struct XorEnvelope;
+    impl crate::registry::EnvelopeFormat for XorEnvelope {
+        fn unwrap(&self, data: &[u8], _: &serde_json::Value) -> io::Result<Vec<u8>> {
+            if !data.starts_with(b"X") {
+                return Err(io::Error::other("bad header"));
+            }
+            Ok(data[1..].iter().map(|b| b ^ 42).collect())
+        }
+        fn wrap(&self, payload: &[u8], _: &serde_json::Value) -> io::Result<Vec<u8>> {
+            Ok(std::iter::once(b'X')
+                .chain(payload.iter().map(|b| b ^ 42))
+                .collect())
+        }
+    }
+    #[tokio::test]
+    async fn envelope_wraps_and_resumes_and_preserves_failures() -> io::Result<()> {
+        use crate::registry::EnvelopeFormat;
+        let dir = tempfile::tempdir()?;
+        let input = dir.path().join("input");
+        std::fs::create_dir(&input)?;
+        let params = serde_json::json!({});
+        for (name, bytes) in [
+            ("large", XorEnvelope.wrap(b"a long payload", &params)?),
+            ("small", XorEnvelope.wrap(b"one", &params)?),
+            ("bad", b"invalid".to_vec()),
+        ] {
+            std::fs::write(input.join(name), bytes)?;
+        }
+        let settings = crate::ResolvedSettings::default();
+        let entries = ["large", "small", "bad"]
+            .into_iter()
+            .map(|name| {
+                let (size, hash) = hash_input(&input.join(name)).unwrap();
+                crate::Entry {
+                    path: StoredPath(name.into()),
+                    member: None,
+                    size,
+                    hash,
+                    action: Action::Convert {
+                        kind: MediaKind::Image,
+                        target: "fake".into(),
+                        encoder: "fake".into(),
+                        settings: crate::ConvertSettings::Image(settings.image()),
+                        envelope: Some(crate::Envelope {
+                            format: "xor".into(),
+                            params: params.clone(),
+                        }),
+                    },
+                }
+            })
+            .collect();
+        let plan = Plan {
+            plan_version: 4,
+            input_root: StoredPath(input.clone()),
+            engine: EngineInfo {
+                name: "fake".into(),
+                version: None,
+                excluded_paths: vec![],
+                notes: vec![],
+                version_check_overridden: false,
+            },
+            settings,
+            tools: vec![],
+            entries,
+        };
+        let output = dir.path().join("output");
+        let mut transforms = TransformerRegistry::default();
+        transforms.register(
+            "fake",
+            Arc::new(Fake {
+                fail: false,
+                wait: false,
+            }),
+        );
+        let mut envelopes = EnvelopeRegistry::default();
+        envelopes.register("xor", Arc::new(XorEnvelope));
+        let (sender, _) = broadcast::channel(20);
+        // Bind the registry so its lifetime covers the async job.
+        let packs = PackRegistry::default();
+        let report = run_job_with_envelopes(
+            &plan,
+            &output,
+            &transforms,
+            &packs,
+            &envelopes,
+            1,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            sender.clone(),
+        )
+        .await?;
+        assert_eq!(
+            XorEnvelope.unwrap(&std::fs::read(output.join("large"))?, &params)?,
+            b"tiny"
+        );
+        assert_eq!(
+            std::fs::read(output.join("small"))?,
+            std::fs::read(input.join("small"))?
+        );
+        assert_eq!(std::fs::read(output.join("bad"))?, b"invalid");
+        assert_eq!(report.failures.len(), 1);
+        assert!(report
+            .skips
+            .iter()
+            .any(|r| r.outcome == "kept original: not smaller"));
+        let before = std::fs::read(output.join(".compressor/journal.jsonl"))?;
+        run_job_with_envelopes(
+            &plan,
+            &output,
+            &transforms,
+            &packs,
+            &envelopes,
+            1,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            sender,
+        )
+        .await?;
+        assert_eq!(
+            before,
+            std::fs::read(output.join(".compressor/journal.jsonl"))?
+        );
+        Ok(())
+    }
     struct FakePack {
         fail: bool,
     }
@@ -634,7 +811,7 @@ mod tests {
         let settings = crate::ResolvedSettings::default();
         let path = StoredPath("game.pck".into());
         let plan = Plan {
-            plan_version: 3,
+            plan_version: 4,
             input_root: StoredPath(input.canonicalize()?),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -664,6 +841,7 @@ mod tests {
                         kind: MediaKind::Image,
                         target: "fake".into(),
                         encoder: "fake".into(),
+                        envelope: None,
                         settings: crate::ConvertSettings::Image(settings.image()),
                     },
                 },
@@ -772,10 +950,11 @@ mod tests {
             kind: MediaKind::Image,
             target: "fake".into(),
             encoder: encoder.into(),
+            envelope: None,
             settings: crate::ConvertSettings::Image(settings.image()),
         };
         let plan = Plan {
-            plan_version: 3,
+            plan_version: 4,
             input_root: StoredPath(input.canonicalize()?),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -883,6 +1062,66 @@ mod tests {
         .await?;
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert_eq!(std::fs::read(out.join("game.pck"))?, b"tiny");
+        Ok(())
+    }
+    #[tokio::test]
+    async fn removal_is_reported_and_repeated_on_resume() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("input");
+        let output = temp.path().join("output");
+        std::fs::create_dir(&input)?;
+        std::fs::write(input.join("unused.m4a"), b"unused")?;
+        let (size, hash) = hash_input(&input.join("unused.m4a"))?;
+        let plan = Plan {
+            plan_version: 4,
+            input_root: StoredPath(input),
+            engine: EngineInfo {
+                name: "fake".into(),
+                version: None,
+                excluded_paths: vec![],
+                notes: vec![],
+                version_check_overridden: false,
+            },
+            settings: crate::ResolvedSettings::default(),
+            tools: vec![],
+            entries: vec![crate::Entry {
+                path: StoredPath("unused.m4a".into()),
+                member: None,
+                size,
+                hash,
+                action: Action::Remove {
+                    reason: "unused on desktop".into(),
+                },
+            }],
+        };
+        let registry = TransformerRegistry::default();
+        let (sender, _) = broadcast::channel(10);
+        let report = run_job(
+            &plan,
+            &output,
+            &registry,
+            1,
+            CancellationToken::new(),
+            sender.clone(),
+        )
+        .await?;
+        assert!(!output.join("unused.m4a").exists());
+        assert_eq!((report.input_bytes, report.output_bytes), (6, 0));
+        assert_eq!(report.removals[0].reason, "unused on desktop");
+        let manifest = crate::planning::read_manifest(&output.join(".compressor/manifest.json"))?;
+        assert_eq!(manifest.entries[0].outcome, "removed");
+        assert!(manifest.entries[0].output_hash.is_none());
+        std::fs::write(output.join("unused.m4a"), b"restored")?;
+        run_job(
+            &plan,
+            &output,
+            &registry,
+            1,
+            CancellationToken::new(),
+            sender,
+        )
+        .await?;
+        assert!(!output.join("unused.m4a").exists());
         Ok(())
     }
     fn snapshot(root: &Path) -> io::Result<BTreeMap<std::path::PathBuf, (String, u32, i64, i64)>> {

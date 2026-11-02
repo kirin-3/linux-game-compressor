@@ -14,6 +14,7 @@ compressor-core.workspace = true
 compressor-media.workspace = true
 compressor-engine-renpy.workspace = true
 compressor-engine-godot.workspace = true
+compressor-engine-rpgm.workspace = true
 clap.workspace = true
 indicatif.workspace = true
 serde.workspace = true
