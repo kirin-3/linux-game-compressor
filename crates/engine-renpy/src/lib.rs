@@ -778,7 +778,7 @@ mod tests {
             &output.path().join(".compressor/journal.jsonl"),
         )?;
         let plan = compressor_core::Plan {
-            plan_version: 4,
+            plan_version: 5,
             input_root: StoredPath(root.to_owned()),
             engine: engine.clone(),
             settings: ResolvedSettings::default(),

@@ -189,7 +189,7 @@ mod tests {
             failure: false,
         };
         let plan = Plan {
-            plan_version: 4,
+            plan_version: 5,
             input_root: StoredPath(temp.path().to_owned()),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -250,7 +250,7 @@ mod tests {
             })
             .collect();
         let plan = Plan {
-            plan_version: 4,
+            plan_version: 5,
             input_root: StoredPath(output.to_owned()),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -310,6 +310,15 @@ pub struct Removal {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ArchiveSummary {
+    pub path: StoredPath,
+    pub member_count: usize,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub outcome: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Report {
     pub complete: bool,
     pub notes: Vec<String>,
@@ -319,6 +328,7 @@ pub struct Report {
     pub output_bytes: u64,
     pub savings_by_media: BTreeMap<String, i128>,
     pub removals: Vec<Removal>,
+    pub archives: Vec<ArchiveSummary>,
     pub skips: Vec<JournalEntry>,
     pub failures: Vec<JournalEntry>,
 }
@@ -366,6 +376,7 @@ pub fn build_report(manifest: &Manifest) -> Report {
     let mut removals = Vec::new();
     let mut skips = Vec::new();
     let mut failures = Vec::new();
+    let mut archives = Vec::new();
     for record in &manifest.entries {
         let mut display_record = record.clone();
         display_record.path = display_path(&record.path, record.member.as_deref());
@@ -374,6 +385,7 @@ pub fn build_report(manifest: &Manifest) -> Report {
         } else if !record.outcome.starts_with("converted")
             && record.outcome != "rebuilt"
             && record.outcome != "removed"
+            && record.outcome != "archived"
         {
             skips.push(display_record);
         }
@@ -383,6 +395,19 @@ pub fn build_report(manifest: &Manifest) -> Report {
             .iter()
             .find(|entry| entry.path == record.path && entry.member == record.member)
         {
+            if let crate::Action::Assemble { members, .. } = &entry.action {
+                archives.push(ArchiveSummary {
+                    path: entry.path.clone(),
+                    member_count: members.len(),
+                    input_bytes: entry.size,
+                    output_bytes: record.output_size,
+                    outcome: record.outcome.clone(),
+                });
+                if record.outcome == "archived" {
+                    *savings_by_media.entry("data".to_owned()).or_insert(0) +=
+                        i128::from(entry.size) - i128::from(record.output_size);
+                }
+            }
             if let crate::Action::Remove { reason } = &entry.action {
                 if record.outcome == "removed" {
                     removals.push(Removal {
@@ -430,6 +455,7 @@ pub fn build_report(manifest: &Manifest) -> Report {
             .sum(),
         savings_by_media,
         removals,
+        archives,
         skips,
         failures,
     }

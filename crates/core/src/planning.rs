@@ -7,11 +7,11 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     os::unix::ffi::OsStrExt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 use walkdir::WalkDir;
 
-const PLAN_VERSION: u64 = 4;
+const PLAN_VERSION: u64 = 5;
 
 fn versioned_json(path: &Path, manifest: bool) -> io::Result<serde_json::Value> {
     let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
@@ -67,6 +67,7 @@ pub fn build_plan(
     transformers: &TransformerRegistry,
 ) -> io::Result<Plan> {
     let root = root.canonicalize()?;
+    let archives = adapter.archives(&root, &engine, &settings)?;
     let paths: Vec<PathBuf> = WalkDir::new(&root)
         .follow_links(false)
         .into_iter()
@@ -122,6 +123,85 @@ pub fn build_plan(
         })
         .collect::<io::Result<_>>()?;
     let mut entries: Vec<Entry> = planned.into_iter().flatten().collect();
+    for archive in archives {
+        if archive.members.is_empty() {
+            continue;
+        }
+        let mut members = Vec::new();
+        let mut metadata = Vec::new();
+        for path in &archive.members {
+            let entry = entries
+                .iter()
+                .find(|e| e.member.is_none() && e.path.0 == *path)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "archive member missing from input",
+                    )
+                })?;
+            if !matches!(&entry.action, Action::Archive { archive: target } if target.0 == archive.path)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "archive members disagree with classification",
+                ));
+            }
+            let name = path
+                .strip_prefix(archive.path.parent().unwrap_or(Path::new("")))
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "archive member outside archive directory",
+                    )
+                })?
+                .to_str()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "archive member name is not UTF-8",
+                    )
+                })?
+                .to_owned();
+            members.push(name.clone());
+            metadata.push((name, entry.size, entry.hash.clone()));
+        }
+        let classified = entries.iter().filter(|e| matches!(&e.action, Action::Archive { archive: target } if target.0 == archive.path)).count();
+        if classified != archive.members.len()
+            || metadata
+                .iter()
+                .map(|m| &m.0)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != metadata.len()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "archive members disagree with classification",
+            ));
+        }
+        metadata.sort();
+        let size = metadata
+            .iter()
+            .try_fold(0u64, |sum, (_, size, _)| sum.checked_add(*size))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "archive size overflow"))?;
+        let hash = blake3::hash(&serde_json::to_vec(&metadata)?)
+            .to_hex()
+            .to_string();
+        entries.push(Entry {
+            path: StoredPath(archive.path),
+            member: None,
+            size,
+            hash,
+            action: Action::Assemble {
+                format: archive.format,
+                params: archive.params,
+                members,
+            },
+        });
+    }
+    if entries.iter().any(|entry| matches!(&entry.action, Action::Archive { archive } if !entries.iter().any(|candidate| candidate.path == *archive && matches!(candidate.action, Action::Assemble { .. })))) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "archive classification has no archive plan"));
+    }
     entries.sort_by(|a, b| a.path.0.cmp(&b.path.0).then(a.member.cmp(&b.member)));
     let notes = adapter.plan_notes(&root, &engine, &settings, &entries);
     engine.notes.extend(notes);
@@ -151,7 +231,7 @@ pub fn build_plan(
         }
     }
     Ok(Plan {
-        plan_version: 4,
+        plan_version: 5,
         input_root: StoredPath(root),
         engine,
         settings,
@@ -175,6 +255,80 @@ pub fn validate_plan(plan: &Plan, root: &Path) -> io::Result<()> {
             "plan input root differs",
         ));
     }
+    for entry in &plan.entries {
+        if entry.path.0.as_os_str().is_empty()
+            || !entry
+                .path
+                .0
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsafe plan path",
+            ));
+        }
+        match &entry.action {
+            Action::Assemble { members, .. } => {
+                if entry.member.is_some() || fs::symlink_metadata(root.join(&entry.path.0)).is_ok()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "archive path already exists in input",
+                    ));
+                }
+                let mut expected = members.clone();
+                expected.sort();
+                let mut actual: Vec<String> = plan
+                    .entries
+                    .iter()
+                    .filter_map(|member| {
+                        if let Action::Archive { archive } = &member.action {
+                            if archive == &entry.path && member.member.is_none() {
+                                return member
+                                    .path
+                                    .0
+                                    .strip_prefix(entry.path.0.parent().unwrap_or(Path::new("")))
+                                    .ok()?
+                                    .to_str()
+                                    .map(str::to_owned);
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+                actual.sort();
+                if expected.is_empty()
+                    || expected != actual
+                    || expected.windows(2).any(|pair| pair[0] == pair[1])
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "archive members disagree with plan",
+                    ));
+                }
+            }
+            Action::Archive { archive }
+                if entry.member.is_some()
+                    || plan
+                        .entries
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.path == *archive
+                                && candidate.member.is_none()
+                                && matches!(candidate.action, Action::Assemble { .. })
+                        })
+                        .count()
+                        != 1 =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "archive member has no unique assemble entry",
+                ));
+            }
+            _ => {}
+        }
+    }
     let mut actual: Vec<PathBuf> = WalkDir::new(&root)
         .follow_links(false)
         .into_iter()
@@ -188,7 +342,7 @@ pub fn validate_plan(plan: &Plan, root: &Path) -> io::Result<()> {
     let mut expected: Vec<PathBuf> = plan
         .entries
         .iter()
-        .filter(|entry| entry.member.is_none())
+        .filter(|entry| entry.member.is_none() && !matches!(entry.action, Action::Assemble { .. }))
         .map(|entry| root.join(&entry.path.0))
         .collect();
     expected.sort();
@@ -200,7 +354,7 @@ pub fn validate_plan(plan: &Plan, root: &Path) -> io::Result<()> {
     }
     plan.entries
         .par_iter()
-        .filter(|entry| entry.member.is_none())
+        .filter(|entry| entry.member.is_none() && !matches!(entry.action, Action::Assemble { .. }))
         .try_for_each(|entry| {
             let (size, hash) = hash_input(&root.join(&entry.path.0))?;
             if size != entry.size || hash != entry.hash {
@@ -218,6 +372,114 @@ pub fn validate_plan(plan: &Plan, root: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use compressor_test_fixtures::Fixture;
+    struct ArchiveAdapter(bool);
+    impl EngineAdapter for ArchiveAdapter {
+        fn id(&self) -> &'static str {
+            "archive"
+        }
+        fn detect(&self, _: &Path) -> io::Result<Option<EngineInfo>> {
+            unreachable!()
+        }
+        fn classify(
+            &self,
+            _: &Path,
+            path: &Path,
+            _: &EngineInfo,
+            _: &ResolvedSettings,
+        ) -> io::Result<Action> {
+            if ["0", "1", "2"].iter().any(|n| path == Path::new(n)) {
+                Ok(Action::Archive {
+                    archive: StoredPath("data.arc".into()),
+                })
+            } else {
+                Ok(Action::Copy {
+                    reason: "test".into(),
+                })
+            }
+        }
+        fn archives(
+            &self,
+            _: &Path,
+            _: &EngineInfo,
+            _: &ResolvedSettings,
+        ) -> io::Result<Vec<crate::registry::ArchivePlan>> {
+            let mut members = vec![PathBuf::from("0"), PathBuf::from("1"), PathBuf::from("2")];
+            if self.0 {
+                members.pop();
+            }
+            Ok(vec![crate::registry::ArchivePlan {
+                path: "data.arc".into(),
+                format: "fake".into(),
+                params: serde_json::json!({}),
+                members,
+            }])
+        }
+    }
+    #[test]
+    fn plans_archives_and_rejects_mismatched_classification() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        for n in 0..5 {
+            fs::write(temp.path().join(n.to_string()), b"test")?;
+        }
+        let engine = EngineInfo {
+            name: "fake".into(),
+            version: None,
+            excluded_paths: vec![],
+            notes: vec![],
+            version_check_overridden: false,
+        };
+        let build = |adapter: &ArchiveAdapter| {
+            build_plan(
+                temp.path(),
+                adapter,
+                engine.clone(),
+                ResolvedSettings::default(),
+                &TransformerRegistry::default(),
+            )
+        };
+        let plan = build(&ArchiveAdapter(false))?;
+        assert_eq!(plan.entries.len(), 6);
+        let archive = plan
+            .entries
+            .iter()
+            .find(|e| e.path.0 == Path::new("data.arc"))
+            .unwrap();
+        assert_eq!(archive.size, 12);
+        assert!(
+            matches!(&archive.action, Action::Assemble { members, .. } if members == &["0", "1", "2"])
+        );
+        validate_plan(&plan, temp.path())?;
+        let mut invalid = plan.clone();
+        invalid
+            .entries
+            .iter_mut()
+            .find(|e| matches!(e.action, Action::Assemble { .. }))
+            .unwrap()
+            .path = StoredPath("3".into());
+        assert!(validate_plan(&invalid, temp.path()).is_err());
+        let mut invalid = plan.clone();
+        invalid
+            .entries
+            .retain(|e| !matches!(e.action, Action::Assemble { .. }));
+        assert!(validate_plan(&invalid, temp.path()).is_err());
+        let mut invalid = plan.clone();
+        if let Action::Assemble { members, .. } = &mut invalid
+            .entries
+            .iter_mut()
+            .find(|e| matches!(e.action, Action::Assemble { .. }))
+            .unwrap()
+            .action
+        {
+            members.pop();
+        }
+        assert!(validate_plan(&invalid, temp.path()).is_err());
+        assert!(!temp.path().join("data.arc").exists());
+        assert_eq!(
+            build(&ArchiveAdapter(true)).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        Ok(())
+    }
     struct Fake;
     impl EngineAdapter for Fake {
         fn id(&self) -> &'static str {

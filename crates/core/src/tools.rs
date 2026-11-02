@@ -113,7 +113,7 @@ mod tests {
     fn empty_path_in_subprocess() -> io::Result<()> {
         if std::env::var_os("COMPRESSOR_EMPTY_PATH_TEST").is_some() {
             let plan = Plan {
-                plan_version: 4,
+                plan_version: 5,
                 input_root: StoredPath("/unused".into()),
                 engine: crate::EngineInfo {
                     name: "fake".into(),

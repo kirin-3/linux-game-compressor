@@ -3,7 +3,9 @@ use crate::{
     journal::{self, Journal, JournalEntry, Report},
     output::check_output,
     planning::{hash_input, validate_plan},
-    registry::{EnvelopeRegistry, PackRegistry, TransformerRegistry},
+    registry::{
+        ArchiveInput, ArchiveRegistry, EnvelopeRegistry, PackRegistry, TransformerRegistry,
+    },
     scheduler::{transform_one_with_force, ConversionOutcome},
     tools::check_tools,
     Action, Plan, StoredPath,
@@ -131,6 +133,34 @@ pub async fn run_job_with_envelopes(
     force: CancellationToken,
     events: broadcast::Sender<Event>,
 ) -> io::Result<Report> {
+    run_job_with_archives(
+        plan,
+        output,
+        registry,
+        packs,
+        envelopes,
+        &ArchiveRegistry::default(),
+        jobs,
+        cancel,
+        force,
+        events,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_job_with_archives(
+    plan: &Plan,
+    output: &Path,
+    registry: &TransformerRegistry,
+    packs: &PackRegistry,
+    envelopes: &EnvelopeRegistry,
+    archives: &ArchiveRegistry,
+    jobs: usize,
+    cancel: CancellationToken,
+    force: CancellationToken,
+    events: broadcast::Sender<Event>,
+) -> io::Result<Report> {
     if jobs == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -159,6 +189,14 @@ pub async fn run_job_with_envelopes(
     // Cache each source directory once; reject malformed plans before creating output.
     let mut pack_dirs = HashMap::new();
     for entry in &plan.entries {
+        if let Action::Assemble { format, .. } = &entry.action {
+            if archives.get(format).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("missing archive format: {format}"),
+                ));
+            }
+        }
         if let Action::Rebuild { format } = &entry.action {
             let handler = packs.get(format).ok_or_else(|| {
                 io::Error::new(
@@ -203,7 +241,10 @@ pub async fn run_job_with_envelopes(
     // Shared (done, bytes saved) snapshot for start events sent from workers.
     let progress = Arc::new((AtomicUsize::new(0), AtomicI64::new(0)));
     for (index, entry) in plan.entries.iter().enumerate() {
-        if matches!(entry.action, Action::Rebuild { .. }) {
+        if matches!(
+            entry.action,
+            Action::Rebuild { .. } | Action::Archive { .. } | Action::Assemble { .. }
+        ) {
             continue;
         }
         if let Some(record) = completed.get(&(entry.path.clone(), entry.member.clone())) {
@@ -489,6 +530,278 @@ pub async fn run_job_with_envelopes(
             });
         }
     }
+    if first_error.is_none() && !cancel.is_cancelled() {
+        for (index, entry) in plan
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e.action, Action::Assemble { .. }))
+        {
+            let Action::Assemble {
+                format,
+                params,
+                members,
+            } = &entry.action
+            else {
+                unreachable!()
+            };
+            let handler = archives
+                .get(format)
+                .expect("preflight checked archive format");
+            let parent = entry.path.0.parent().unwrap_or(Path::new(""));
+            let gathered: Vec<_> = members.iter().map(|name| plan.entries.iter().find(|e| e.path.0 == parent.join(name) && matches!(&e.action, Action::Archive { archive } if archive == &entry.path)).expect("validated archive member")).collect();
+            let inputs: Vec<_> = gathered
+                .iter()
+                .zip(members)
+                .map(|(member, name)| ArchiveInput {
+                    name: name.clone(),
+                    path: plan.input_root.0.join(&member.path.0),
+                    size: member.size,
+                    hash: member.hash.clone(),
+                })
+                .collect();
+            let latest = journal::make_manifest(plan.clone(), &records, false);
+            let resumed = completed
+                .get(&(entry.path.clone(), None))
+                .filter(|record| record.outcome == "archived")
+                .filter(|_| {
+                    gathered.iter().all(|member| {
+                        !output.join(&member.path.0).exists()
+                            && latest.entries.iter().any(|record| {
+                                record.path == member.path
+                                    && record.member.is_none()
+                                    && record.outcome == "archived"
+                                    && record.input_hash == member.hash
+                            })
+                    })
+                });
+            if let Some(record) = resumed {
+                for member in &gathered {
+                    done += 1;
+                    saved += i128::from(member.size);
+                    let _ = events.send(Event::FileResult {
+                        path: member.path.clone(),
+                        outcome: "archived".into(),
+                        done,
+                        total,
+                        bytes_saved: saved,
+                    });
+                }
+                done += 1;
+                saved -= i128::from(record.output_size);
+                let _ = events.send(Event::FileResult {
+                    path: entry.path.clone(),
+                    outcome: record.outcome.clone(),
+                    done,
+                    total,
+                    bytes_saved: saved,
+                });
+                continue;
+            }
+            let temporary = metadata.join("tmp").join(format!("{index}.archive"));
+            ensure_output_parent(&output, &entry.path.0)?;
+            match std::fs::remove_file(output.join(&entry.path.0)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            let _ = events.send(Event::FileStart {
+                path: entry.path.clone(),
+                done,
+                total,
+                bytes_saved: saved,
+            });
+            let result = (|| -> io::Result<()> {
+                handler.write(&inputs, &temporary, params, &cancel)?;
+                let directory = handler.read_directory(&temporary)?;
+                if directory.len() != inputs.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "archive directory does not match plan",
+                    ));
+                }
+                for input in &inputs {
+                    let member =
+                        directory
+                            .iter()
+                            .find(|m| m.name == input.name)
+                            .ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidData, "archive member missing")
+                            })?;
+                    let (size, hash) = handler.hash_member(&temporary, member)?;
+                    if size != input.size || hash != input.hash {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "archive member mismatch",
+                        ));
+                    }
+                }
+                if std::fs::metadata(&temporary)?.len() >= entry.size {
+                    return Err(io::Error::other("archive not smaller"));
+                }
+                if cancel.is_cancelled() {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+                }
+                ensure_output_parent(&output, &entry.path.0)?;
+                std::fs::rename(&temporary, output.join(&entry.path.0))?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let _ = std::fs::remove_file(&temporary);
+                if cancel.is_cancelled() {
+                    break;
+                }
+                if error.kind() == io::ErrorKind::InvalidData
+                    && error.to_string().contains("stale archive member")
+                {
+                    first_error = Some(error);
+                    break;
+                }
+                let not_smaller = error.to_string() == "archive not smaller";
+                let outcome = if not_smaller {
+                    "kept original: not smaller".to_owned()
+                } else {
+                    format!("archive failed: {error}")
+                };
+                for member in &gathered {
+                    let source = plan.input_root.0.join(&member.path.0);
+                    if hash_input(&source)? != (member.size, member.hash.clone()) {
+                        first_error = Some(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("stale archive member: {}", member.path.0.display()),
+                        ));
+                        break;
+                    }
+                    ensure_output_parent(&output, &member.path.0)?;
+                    copy::stage_copy_entry(
+                        &plan.input_root.0,
+                        &output,
+                        &member.path.0,
+                        &temporary,
+                    )?;
+                    if hash_input(&temporary)? != (member.size, member.hash.clone()) {
+                        let _ = std::fs::remove_file(&temporary);
+                        first_error = Some(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("stale archive member: {}", member.path.0.display()),
+                        ));
+                        break;
+                    }
+                    std::fs::rename(&temporary, output.join(&member.path.0))?;
+                    let record = JournalEntry {
+                        path: member.path.clone(),
+                        member: None,
+                        plan_hash: plan_hash.clone(),
+                        input_hash: member.hash.clone(),
+                        output_hash: Some(member.hash.clone()),
+                        input_size: member.size,
+                        output_size: member.size,
+                        outcome: "copied".into(),
+                        failure: false,
+                    };
+                    journal
+                        .lock()
+                        .map_err(|_| io::Error::other("journal lock poisoned"))?
+                        .append(&record)?;
+                    done += 1;
+                    let _ = events.send(Event::FileResult {
+                        path: member.path.clone(),
+                        outcome: record.outcome,
+                        done,
+                        total,
+                        bytes_saved: saved,
+                    });
+                }
+                if first_error.is_some() {
+                    break;
+                }
+                let _ = std::fs::remove_file(output.join(&entry.path.0));
+                let record = JournalEntry {
+                    path: entry.path.clone(),
+                    member: None,
+                    plan_hash: plan_hash.clone(),
+                    input_hash: entry.hash.clone(),
+                    output_hash: None,
+                    input_size: 0,
+                    output_size: 0,
+                    outcome: outcome.clone(),
+                    failure: !not_smaller,
+                };
+                journal
+                    .lock()
+                    .map_err(|_| io::Error::other("journal lock poisoned"))?
+                    .append(&record)?;
+                done += 1;
+                let _ = events.send(Event::FileResult {
+                    path: entry.path.clone(),
+                    outcome,
+                    done,
+                    total,
+                    bytes_saved: saved,
+                });
+                continue;
+            }
+            for member in &gathered {
+                ensure_output_parent(&output, &member.path.0)?;
+                match std::fs::remove_file(output.join(&member.path.0)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            for member in gathered {
+                let record = JournalEntry {
+                    path: member.path.clone(),
+                    member: None,
+                    plan_hash: plan_hash.clone(),
+                    input_hash: member.hash.clone(),
+                    output_hash: None,
+                    input_size: member.size,
+                    output_size: 0,
+                    outcome: "archived".into(),
+                    failure: false,
+                };
+                journal
+                    .lock()
+                    .map_err(|_| io::Error::other("journal lock poisoned"))?
+                    .append(&record)?;
+                done += 1;
+                saved += i128::from(member.size);
+                let _ = events.send(Event::FileResult {
+                    path: member.path.clone(),
+                    outcome: record.outcome,
+                    done,
+                    total,
+                    bytes_saved: saved,
+                });
+            }
+            let (size, hash) = hash_input(&output.join(&entry.path.0))?;
+            let record = JournalEntry {
+                path: entry.path.clone(),
+                member: None,
+                plan_hash: plan_hash.clone(),
+                input_hash: entry.hash.clone(),
+                output_hash: Some(hash),
+                input_size: 0,
+                output_size: size,
+                outcome: "archived".into(),
+                failure: false,
+            };
+            journal
+                .lock()
+                .map_err(|_| io::Error::other("journal lock poisoned"))?
+                .append(&record)?;
+            done += 1;
+            saved -= i128::from(size);
+            let _ = events.send(Event::FileResult {
+                path: entry.path.clone(),
+                outcome: record.outcome,
+                done,
+                total,
+                bytes_saved: saved,
+            });
+        }
+    }
     let journal = journal
         .lock()
         .map_err(|_| io::Error::other("journal lock poisoned"))?;
@@ -580,6 +893,288 @@ mod tests {
         EngineInfo, MediaKind, ToolSpec,
     };
     use std::{collections::BTreeMap, os::unix::fs::MetadataExt};
+    struct FakeArchive(&'static str, Arc<AtomicUsize>);
+    impl crate::registry::ArchiveFormat for FakeArchive {
+        fn write(
+            &self,
+            members: &[ArchiveInput],
+            output: &Path,
+            _: &serde_json::Value,
+            cancel: &CancellationToken,
+        ) -> io::Result<()> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            let mut result = Vec::new();
+            for member in members {
+                let bytes = std::fs::read(&member.path)?;
+                assert!(bytes.iter().all(|b| *b == bytes[0]));
+                result.push(member.name.len() as u8);
+                result.extend(member.name.as_bytes());
+                result.extend((bytes.len() as u64).to_le_bytes());
+                result.push(bytes[0]);
+            }
+            if self.0 == "inflate" {
+                result.resize(150, 0);
+            }
+            std::fs::write(output, result)?;
+            if self.0 == "cancel" {
+                cancel.cancel();
+            }
+            Ok(())
+        }
+        fn read_directory(&self, archive: &Path) -> io::Result<Vec<crate::registry::PackMember>> {
+            let bytes = std::fs::read(archive)?;
+            let mut cursor = 0;
+            let mut result = Vec::new();
+            while cursor < bytes.len() {
+                if bytes[cursor] == 0 {
+                    break;
+                }
+                let len = bytes[cursor] as usize;
+                cursor += 1;
+                let name = String::from_utf8(bytes[cursor..cursor + len].to_vec()).unwrap();
+                cursor += len;
+                let size = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+                cursor += 8;
+                result.push(crate::registry::PackMember {
+                    name,
+                    offset: cursor as u64,
+                    size,
+                });
+                cursor += 1;
+            }
+            Ok(result)
+        }
+        fn hash_member(
+            &self,
+            archive: &Path,
+            member: &crate::registry::PackMember,
+        ) -> io::Result<(u64, String)> {
+            let data = std::fs::read(archive)?;
+            let bytes = vec![
+                data[member.offset as usize] ^ u8::from(self.0 == "corrupt");
+                member.size as usize
+            ];
+            Ok((member.size, blake3::hash(&bytes).to_hex().to_string()))
+        }
+    }
+    #[tokio::test]
+    async fn assembles_archive_and_records_members() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("input");
+        let output = temp.path().join("output");
+        std::fs::create_dir(&input)?;
+        std::fs::write(input.join("level0"), vec![42; 100])?;
+        let (size, hash) = hash_input(&input.join("level0"))?;
+        let plan = Plan {
+            plan_version: 5,
+            input_root: StoredPath(input),
+            engine: EngineInfo {
+                name: "fake".into(),
+                version: None,
+                excluded_paths: vec![],
+                notes: vec![],
+                version_check_overridden: false,
+            },
+            settings: Default::default(),
+            tools: vec![],
+            entries: vec![
+                crate::Entry {
+                    path: StoredPath("level0".into()),
+                    member: None,
+                    size,
+                    hash: hash.clone(),
+                    action: Action::Archive {
+                        archive: StoredPath("data.arc".into()),
+                    },
+                },
+                crate::Entry {
+                    path: StoredPath("data.arc".into()),
+                    member: None,
+                    size,
+                    hash: "synthetic".into(),
+                    action: Action::Assemble {
+                        format: "fake".into(),
+                        params: serde_json::json!({}),
+                        members: vec!["level0".into()],
+                    },
+                },
+            ],
+        };
+        let mut archives = ArchiveRegistry::default();
+        let writes = Arc::new(AtomicUsize::new(0));
+        archives.register("fake", Arc::new(FakeArchive("success", writes.clone())));
+        let (events, mut received) = broadcast::channel(16);
+        let report = run_job_with_archives(
+            &plan,
+            &output,
+            &TransformerRegistry::default(),
+            &PackRegistry::default(),
+            &EnvelopeRegistry::default(),
+            &archives,
+            1,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            events,
+        )
+        .await?;
+        assert_eq!(
+            report.output_bytes,
+            std::fs::metadata(output.join("data.arc"))?.len()
+        );
+        assert_eq!(report.archives.len(), 1);
+        assert_eq!(report.archives[0].member_count, 1);
+        assert_eq!(
+            report.savings_by_media["data"],
+            i128::from(size) - i128::from(report.output_bytes)
+        );
+        let mut results = 0;
+        while let Ok(event) = received.try_recv() {
+            if matches!(event, Event::FileResult { .. }) {
+                results += 1;
+            }
+        }
+        assert_eq!(results, plan.entries.len());
+        assert!(output.join("data.arc").exists());
+        assert!(!output.join("level0").exists());
+        let manifest = crate::planning::read_manifest(&output.join(".compressor/manifest.json"))?;
+        assert_eq!(manifest.entries.len(), 2);
+        assert!(manifest
+            .entries
+            .iter()
+            .all(|entry| entry.outcome == "archived"));
+        assert_eq!(
+            manifest
+                .entries
+                .iter()
+                .find(|e| e.path.0 == Path::new("level0"))
+                .unwrap()
+                .output_size,
+            0
+        );
+        let (events, _) = broadcast::channel(16);
+        run_job_with_archives(
+            &plan,
+            &output,
+            &TransformerRegistry::default(),
+            &PackRegistry::default(),
+            &EnvelopeRegistry::default(),
+            &archives,
+            1,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            events,
+        )
+        .await?;
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        std::fs::write(output.join("data.arc"), b"tampered")?;
+        std::fs::write(output.join("level0"), b"old fallback")?;
+        let (events, _) = broadcast::channel(16);
+        run_job_with_archives(
+            &plan,
+            &output,
+            &TransformerRegistry::default(),
+            &PackRegistry::default(),
+            &EnvelopeRegistry::default(),
+            &archives,
+            1,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            events,
+        )
+        .await?;
+        assert_eq!(writes.load(Ordering::SeqCst), 2);
+        assert!(!output.join("level0").exists());
+        let cancel_output = temp.path().join("cancel");
+        let mut cancelling = ArchiveRegistry::default();
+        cancelling.register("fake", Arc::new(FakeArchive("cancel", writes.clone())));
+        let (events, _) = broadcast::channel(16);
+        assert_eq!(
+            run_job_with_archives(
+                &plan,
+                &cancel_output,
+                &TransformerRegistry::default(),
+                &PackRegistry::default(),
+                &EnvelopeRegistry::default(),
+                &cancelling,
+                1,
+                CancellationToken::new(),
+                CancellationToken::new(),
+                events
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(!cancel_output.join("data.arc").exists());
+        let (events, _) = broadcast::channel(16);
+        run_job_with_archives(
+            &plan,
+            &cancel_output,
+            &TransformerRegistry::default(),
+            &PackRegistry::default(),
+            &EnvelopeRegistry::default(),
+            &archives,
+            1,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            events,
+        )
+        .await?;
+        assert!(cancel_output.join("data.arc").exists());
+        for mode in ["inflate", "corrupt"] {
+            let output = temp.path().join(mode);
+            let mut archives = ArchiveRegistry::default();
+            archives.register("fake", Arc::new(FakeArchive(mode, writes.clone())));
+            let (events, _) = broadcast::channel(16);
+            let report = run_job_with_archives(
+                &plan,
+                &output,
+                &TransformerRegistry::default(),
+                &PackRegistry::default(),
+                &EnvelopeRegistry::default(),
+                &archives,
+                1,
+                CancellationToken::new(),
+                CancellationToken::new(),
+                events,
+            )
+            .await?;
+            assert_eq!(std::fs::read(output.join("level0"))?, vec![42; 100]);
+            assert!(!output.join("data.arc").exists());
+            let manifest =
+                crate::planning::read_manifest(&output.join(".compressor/manifest.json"))?;
+            let record = manifest
+                .entries
+                .iter()
+                .find(|e| e.path.0 == Path::new("data.arc"))
+                .unwrap();
+            if mode == "inflate" {
+                assert_eq!(record.outcome, "kept original: not smaller");
+            } else {
+                assert_eq!(report.failures.len(), 1);
+            }
+        }
+        std::fs::write(plan.input_root.0.join("level0"), vec![43; 100])?;
+        let output = temp.path().join("stale");
+        let (events, _) = broadcast::channel(16);
+        assert!(run_job_with_archives(
+            &plan,
+            &output,
+            &TransformerRegistry::default(),
+            &PackRegistry::default(),
+            &EnvelopeRegistry::default(),
+            &archives,
+            1,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            events
+        )
+        .await
+        .is_err());
+        assert!(!output.join("data.arc").exists());
+        Ok(())
+    }
     struct Adapter;
     impl EngineAdapter for Adapter {
         fn id(&self) -> &'static str {
@@ -701,7 +1296,7 @@ mod tests {
             })
             .collect();
         let plan = Plan {
-            plan_version: 4,
+            plan_version: 5,
             input_root: StoredPath(input.clone()),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -811,7 +1406,7 @@ mod tests {
         let settings = crate::ResolvedSettings::default();
         let path = StoredPath("game.pck".into());
         let plan = Plan {
-            plan_version: 4,
+            plan_version: 5,
             input_root: StoredPath(input.canonicalize()?),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -954,7 +1549,7 @@ mod tests {
             settings: crate::ConvertSettings::Image(settings.image()),
         };
         let plan = Plan {
-            plan_version: 4,
+            plan_version: 5,
             input_root: StoredPath(input.canonicalize()?),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -1073,7 +1668,7 @@ mod tests {
         std::fs::write(input.join("unused.m4a"), b"unused")?;
         let (size, hash) = hash_input(&input.join("unused.m4a"))?;
         let plan = Plan {
-            plan_version: 4,
+            plan_version: 5,
             input_root: StoredPath(input),
             engine: EngineInfo {
                 name: "fake".into(),

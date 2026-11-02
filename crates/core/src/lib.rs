@@ -275,6 +275,14 @@ pub struct Envelope {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
+    Archive {
+        archive: StoredPath,
+    },
+    Assemble {
+        format: String,
+        params: serde_json::Value,
+        members: Vec<String>,
+    },
     Rebuild {
         format: String,
     },
@@ -429,7 +437,7 @@ mod tests {
             PathBuf::from(OsString::from_vec(b"game/invalid-\xff.png".to_vec())),
         ];
         let plan = Plan {
-            plan_version: 4,
+            plan_version: 5,
             input_root: StoredPath("/tmp/game".into()),
             engine: EngineInfo {
                 name: "Ren'Py".into(),
@@ -483,6 +491,26 @@ mod tests {
                     hash: "ghi".into(),
                     action: Action::Rebuild {
                         format: "test-pack".into(),
+                    },
+                },
+                Entry {
+                    path: StoredPath("data/level0".into()),
+                    member: None,
+                    size: 3,
+                    hash: "jkl".into(),
+                    action: Action::Archive {
+                        archive: StoredPath("data/data.unity3d".into()),
+                    },
+                },
+                Entry {
+                    path: StoredPath("data/data.unity3d".into()),
+                    member: None,
+                    size: 3,
+                    hash: "mno".into(),
+                    action: Action::Assemble {
+                        format: "unity-fs".into(),
+                        params: serde_json::json!({"format_version": 8}),
+                        members: vec!["level0".into()],
                     },
                 },
             ],

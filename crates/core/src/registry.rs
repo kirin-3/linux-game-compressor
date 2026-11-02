@@ -22,6 +22,14 @@ pub struct MemberPlan {
     pub action: Action,
 }
 
+#[derive(Clone, Debug)]
+pub struct ArchivePlan {
+    pub path: PathBuf,
+    pub format: String,
+    pub params: serde_json::Value,
+    pub members: Vec<PathBuf>,
+}
+
 /// Engine-specific detection and decisions; paths passed to `classify` are relative.
 pub trait EngineAdapter: Send + Sync {
     fn id(&self) -> &'static str;
@@ -29,6 +37,14 @@ pub trait EngineAdapter: Send + Sync {
         Vec::new()
     }
     fn detect(&self, root: &Path) -> io::Result<Option<EngineInfo>>;
+    fn archives(
+        &self,
+        _root: &Path,
+        _engine: &EngineInfo,
+        _settings: &ResolvedSettings,
+    ) -> io::Result<Vec<ArchivePlan>> {
+        Ok(Vec::new())
+    }
     fn classify(
         &self,
         root: &Path,
@@ -108,6 +124,37 @@ pub struct PackMember {
     pub size: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct ArchiveInput {
+    pub name: String,
+    pub path: PathBuf,
+    pub size: u64,
+    pub hash: String,
+}
+
+pub trait ArchiveFormat: Send + Sync {
+    fn write(
+        &self,
+        members: &[ArchiveInput],
+        output: &Path,
+        params: &serde_json::Value,
+        cancel: &CancellationToken,
+    ) -> io::Result<()>;
+    fn read_directory(&self, archive: &Path) -> io::Result<Vec<PackMember>>;
+    fn hash_member(&self, archive: &Path, member: &PackMember) -> io::Result<(u64, String)>;
+}
+
+#[derive(Default)]
+pub struct ArchiveRegistry(HashMap<String, Arc<dyn ArchiveFormat>>);
+impl ArchiveRegistry {
+    pub fn register(&mut self, format: &str, handler: Arc<dyn ArchiveFormat>) {
+        self.0.insert(format.to_owned(), handler);
+    }
+    pub fn get(&self, format: &str) -> Option<Arc<dyn ArchiveFormat>> {
+        self.0.get(format).cloned()
+    }
+}
+
 pub trait PackFormat: Send + Sync {
     fn read_directory(&self, input: &Path) -> io::Result<Vec<PackMember>>;
     fn read_member(&self, input: &Path, member: &PackMember) -> io::Result<Vec<u8>>;
@@ -182,6 +229,24 @@ impl TransformerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct Archive;
+    impl ArchiveFormat for Archive {
+        fn write(
+            &self,
+            _: &[ArchiveInput],
+            _: &Path,
+            _: &serde_json::Value,
+            _: &CancellationToken,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+        fn read_directory(&self, _: &Path) -> io::Result<Vec<PackMember>> {
+            Ok(vec![])
+        }
+        fn hash_member(&self, _: &Path, _: &PackMember) -> io::Result<(u64, String)> {
+            Ok((0, "fake".into()))
+        }
+    }
     struct Adapter;
     impl EngineAdapter for Adapter {
         fn id(&self) -> &'static str {
@@ -241,6 +306,15 @@ mod tests {
     }
     #[test]
     fn registries_find_fake_components() {
+        let mut archives = ArchiveRegistry::default();
+        archives.register("fake", Arc::new(Archive));
+        assert!(archives.get("missing").is_none());
+        assert!(archives
+            .get("fake")
+            .unwrap()
+            .read_directory(Path::new("."))
+            .unwrap()
+            .is_empty());
         let mut engines = EngineRegistry::default();
         engines.register(Arc::new(Adapter));
         let (adapter, info) = engines.detect(Path::new(".")).unwrap().unwrap();

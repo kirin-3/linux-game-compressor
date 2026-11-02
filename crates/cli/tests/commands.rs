@@ -17,7 +17,7 @@ fn incompatible_plans_and_manifests_do_not_change_output() -> io::Result<()> {
     let tmp = tempfile::tempdir()?;
     let plan = tmp.path().join("old-plan.json");
     let out = tmp.path().join("output");
-    std::fs::write(&plan, br#"{"plan_version":3}"#)?;
+    std::fs::write(&plan, br#"{"plan_version":4}"#)?;
     let args = [
         "compress",
         str_path(fixture.root()),
@@ -32,7 +32,7 @@ fn incompatible_plans_and_manifests_do_not_change_output() -> io::Result<()> {
     assert!(!out.exists());
     std::fs::create_dir_all(out.join(".compressor"))?;
     let manifest = out.join(".compressor/manifest.json");
-    let old = br#"{"plan":{"plan_version":3}}"#;
+    let old = br#"{"plan":{"plan_version":4}}"#;
     std::fs::write(&manifest, old)?;
     std::fs::write(out.join("keep"), b"unchanged")?;
     let result = command(&[
@@ -996,5 +996,99 @@ fn documented_commands_run_against_rpgmaker_fixture() -> io::Result<()> {
             String::from_utf8_lossy(&result.stderr)
         );
     }
+    Ok(())
+}
+
+#[test]
+fn inspect_unity_fixture() -> io::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let data = root.join("Game_Data");
+    std::fs::create_dir_all(data.join("StreamingAssets"))?;
+    std::fs::write(root.join("Game.exe"), b"player")?;
+    let mut header = vec![0; 8];
+    header.extend_from_slice(&22u32.to_be_bytes());
+    header.extend_from_slice(&[0; 36]);
+    header.extend_from_slice(b"2022.3.7f1\0");
+    header.extend_from_slice(&19i32.to_le_bytes());
+    std::fs::write(data.join("globalgamemanagers"), &header)?;
+    std::fs::write(data.join("level0"), b"level")?;
+    std::fs::write(data.join("resources.resource"), b"audio")?;
+    std::fs::write(data.join("StreamingAssets/bundle"), b"UnityFS\0test")?;
+    let result = command(&["inspect", str_path(root), "--json"])?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+    let unity = &json["unity"][0];
+    assert_eq!(unity["version"], "2022.3.7f1");
+    assert_eq!(unity["platform"], "Windows 64-bit");
+    assert_eq!(unity["compressed"], false);
+    assert_eq!(unity["archive_files"]["count"], 2);
+    assert_eq!(unity["archive_files"]["bytes"], (header.len() + 5) as u64);
+    assert_eq!(unity["streamed_resources"]["count"], 1);
+    assert_eq!(unity["streamed_resources"]["bytes"], 5);
+    assert_eq!(unity["bundles"]["count"], 1);
+    assert_eq!(unity["bundles"]["bytes"], 12);
+    let result = command(&["inspect", str_path(root)])?;
+    assert!(String::from_utf8_lossy(&result.stdout).contains("Windows 64-bit"));
+    let result = command(&["plan", str_path(root), "--list"])?;
+    assert!(result.status.success());
+    let text = String::from_utf8_lossy(&result.stdout);
+    let snapshot: Vec<_> = text
+        .lines()
+        .filter(|line| {
+            line.starts_with("archives to write:")
+                || line.starts_with("Game_Data/data.unity3d:")
+                || line.starts_with("Game_Data/level0:")
+        })
+        .collect();
+    assert_eq!(
+        snapshot,
+        vec![
+            format!("archives to write: 1 (2 files, {} bytes)", header.len() + 5),
+            "Game_Data/data.unity3d: assemble: unity-fs (2 files)".into(),
+            "Game_Data/level0: archive: Game_Data/data.unity3d".into()
+        ]
+    );
+    std::fs::write(data.join("level0"), vec![42; 4096])?;
+    let output_dir = tempfile::tempdir()?;
+    let output = output_dir.path().join("compressed");
+    let result = command(&["compress", str_path(root), "--output", str_path(&output)])?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(command(&["verify", str_path(&output)])?.status.success());
+    let archive = output.join("Game_Data/data.unity3d");
+    let original = std::fs::read(&archive)?;
+    let mut changed = original.clone();
+    let last = changed.len() - 1;
+    changed[last] ^= 1;
+    std::fs::write(&archive, changed)?;
+    let result = command(&["verify", str_path(&output)])?;
+    assert!(!result.status.success());
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        report.contains("Game_Data/data.unity3d::level0"),
+        "{report}"
+    );
+    std::fs::write(&archive, original)?;
+    std::fs::write(output.join("Game_Data/level0"), b"restored")?;
+    let result = command(&["verify", str_path(&output)])?;
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Game_Data/level0"));
+    std::fs::remove_file(output.join("Game_Data/level0"))?;
+    std::fs::remove_file(&archive)?;
+    let result = command(&["verify", str_path(&output)])?;
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Game_Data/data.unity3d"));
     Ok(())
 }

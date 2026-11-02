@@ -1,8 +1,10 @@
 use clap::{Parser, Subcommand};
 use compressor_core::{
-    job::{run_job_with_envelopes, Event},
+    job::{run_job_with_archives, Event},
     planning::{build_plan, hash_input, validate_plan},
-    registry::{EngineRegistry, EnvelopeRegistry, PackRegistry, TransformerRegistry},
+    registry::{
+        ArchiveRegistry, EngineRegistry, EnvelopeRegistry, PackRegistry, TransformerRegistry,
+    },
     Action, Plan,
 };
 use compressor_engine_renpy::RenpyAdapter;
@@ -103,6 +105,9 @@ fn engine_registry(allow: bool) -> EngineRegistry {
     }));
     engines.register(Arc::new(compressor_engine_godot::adapter::GodotAdapter));
     engines.register(Arc::new(compressor_engine_rpgm::RpgMakerAdapter::default()));
+    engines.register(Arc::new(compressor_engine_unity::UnityAdapter {
+        allow_unknown_version: allow,
+    }));
     engines
 }
 fn pack_registry() -> PackRegistry {
@@ -112,6 +117,11 @@ fn pack_registry() -> PackRegistry {
         Arc::new(compressor_engine_godot::GodotPackFormat),
     );
     packs
+}
+fn archive_registry() -> ArchiveRegistry {
+    let mut registry = ArchiveRegistry::default();
+    registry.register("unity-fs", Arc::new(compressor_engine_unity::UnityFs));
+    registry
 }
 fn envelope_registry() -> EnvelopeRegistry {
     let mut registry = EnvelopeRegistry::default();
@@ -155,6 +165,10 @@ fn plan_counts(plan: &Plan) -> BTreeMap<String, usize> {
             Action::Copy { reason } => format!("copy: {reason}"),
             Action::Skip { reason } => format!("skip: {reason}"),
             Action::Rebuild { format } => format!("rebuild: {format}"),
+            Action::Archive { archive } => format!("archive: {}", archive.0.display()),
+            Action::Assemble {
+                format, members, ..
+            } => format!("assemble: {format} ({} files)", members.len()),
         };
         *counts.entry(key).or_insert(0) += 1;
     }
@@ -294,19 +308,102 @@ fn inspect_rpgmaker(plan: &Plan) -> io::Result<Option<RpgMakerInfo>> {
 struct InspectResult {
     engine: compressor_core::EngineInfo,
     rpgmaker: Option<RpgMakerInfo>,
+    unity: Vec<UnityInfo>,
     media: BTreeMap<String, MediaCount>,
     archives: Vec<(String, u64)>,
     packs: Vec<PackInfo>,
     tools: Vec<(String, bool, BTreeMap<String, bool>)>,
     blockers: Vec<String>,
 }
+#[derive(serde::Serialize)]
+struct UnityInfo {
+    path: compressor_core::StoredPath,
+    version: Option<String>,
+    platform: String,
+    compressed: bool,
+    archive_files: MediaCount,
+    streamed_resources: MediaCount,
+    bundles: MediaCount,
+}
+fn inspect_unity(plan: &Plan) -> io::Result<Vec<UnityInfo>> {
+    if plan.engine.name != "Unity" {
+        return Ok(vec![]);
+    }
+    let root = &plan.input_root.0;
+    let mut result = Vec::new();
+    for folder in compressor_engine_unity::data_folders(root)? {
+        let header = compressor_engine_unity::read_player_header(
+            &root.join(&folder).join("globalgamemanagers"),
+        )
+        .ok();
+        let platform = header
+            .as_ref()
+            .map(|h| match h.platform {
+                5 => "Windows 32-bit".into(),
+                19 => "Windows 64-bit".into(),
+                17 => "Linux 32-bit".into(),
+                24 => "Linux 64-bit".into(),
+                25 => "Linux universal".into(),
+                n => format!("platform {n}"),
+            })
+            .unwrap_or_else(|| "unknown".into());
+        let mut info = UnityInfo {
+            path: compressor_core::StoredPath(folder.clone()),
+            version: header.map(|h| h.version),
+            platform,
+            compressed: root.join(&folder).join("data.unity3d").is_file(),
+            archive_files: MediaCount { count: 0, bytes: 0 },
+            streamed_resources: MediaCount { count: 0, bytes: 0 },
+            bundles: MediaCount { count: 0, bytes: 0 },
+        };
+        for entry in &plan.entries {
+            if entry.member.is_some()
+                || !entry.path.0.starts_with(&folder)
+                || matches!(entry.action, Action::Assemble { .. })
+            {
+                continue;
+            }
+            if matches!(entry.action, Action::Archive { .. }) {
+                info.archive_files.count += 1;
+                info.archive_files.bytes += entry.size;
+            }
+            if entry
+                .path
+                .0
+                .extension()
+                .is_some_and(|ext| ext == "resource")
+            {
+                info.streamed_resources.count += 1;
+                info.streamed_resources.bytes += entry.size;
+            }
+            use std::io::Read;
+            if let Ok(mut file) = std::fs::File::open(root.join(&entry.path.0)) {
+                let mut magic = [0u8; 8];
+                if file.read_exact(&mut magic).is_ok()
+                    && &magic == b"UnityFS\0"
+                    && entry
+                        .path
+                        .0
+                        .file_name()
+                        .is_some_and(|name| name != "data.unity3d")
+                {
+                    info.bundles.count += 1;
+                    info.bundles.bytes += entry.size;
+                }
+            }
+        }
+        result.push(info);
+    }
+    Ok(result)
+}
 fn inspect(game: &Path) -> io::Result<InspectResult> {
     let plan = new_plan(game, None, &[], false)?;
     let rpgmaker = inspect_rpgmaker(&plan)?;
+    let unity = inspect_unity(&plan)?;
     let mut media = BTreeMap::<String, MediaCount>::new();
     let mut archives = Vec::new();
     for entry in &plan.entries {
-        if entry.member.is_some() {
+        if entry.member.is_some() || matches!(entry.action, Action::Assemble { .. }) {
             continue;
         }
         let path = plan.input_root.0.join(&entry.path.0);
@@ -386,6 +483,7 @@ fn inspect(game: &Path) -> io::Result<InspectResult> {
     Ok(InspectResult {
         engine: plan.engine,
         rpgmaker,
+        unity,
         media,
         archives,
         packs: inspect_packs(game)?,
@@ -503,6 +601,20 @@ async fn run(cli: Cli) -> io::Result<i32> {
                         rpg.encrypted_count, rpg.encrypted_bytes, rpg.video_count, rpg.video_bytes
                     );
                 }
+                for unity in &result.unity {
+                    println!(
+                        "Unity data: {} ({}; {}; {})",
+                        unity.path.0.display(),
+                        unity.version.as_deref().unwrap_or("unknown"),
+                        unity.platform,
+                        if unity.compressed {
+                            "compressed"
+                        } else {
+                            "not compressed"
+                        }
+                    );
+                    println!("  to archive: {} files, {} bytes; streamed resources: {} files, {} bytes; bundles: {} files, {} bytes", unity.archive_files.count, unity.archive_files.bytes, unity.streamed_resources.count, unity.streamed_resources.bytes, unity.bundles.count, unity.bundles.bytes);
+                }
                 for (name, count) in result.media {
                     println!("{name}: {} files, {} bytes", count.count, count.bytes);
                 }
@@ -583,6 +695,20 @@ async fn run(cli: Cli) -> io::Result<i32> {
                         .filter(|e| matches!(e.action, Action::Rebuild { .. }))
                         .count()
                 );
+                let archives: Vec<_> = plan
+                    .entries
+                    .iter()
+                    .filter_map(|e| match &e.action {
+                        Action::Assemble { members, .. } => Some((members.len(), e.size)),
+                        _ => None,
+                    })
+                    .collect();
+                println!(
+                    "archives to write: {} ({} files, {} bytes)",
+                    archives.len(),
+                    archives.iter().map(|(count, _)| count).sum::<usize>(),
+                    archives.iter().map(|(_, size)| size).sum::<u64>()
+                );
                 let mut by_media = BTreeMap::<String, usize>::new();
                 for entry in &plan.entries {
                     let media = match &entry.action {
@@ -623,6 +749,10 @@ async fn run(cli: Cli) -> io::Result<i32> {
                         Action::Copy { reason } => format!("copy: {reason}"),
                         Action::Skip { reason } => format!("skip: {reason}"),
                         Action::Rebuild { format } => format!("rebuild: {format}"),
+                        Action::Archive { archive } => format!("archive: {}", archive.0.display()),
+                        Action::Assemble {
+                            format, members, ..
+                        } => format!("assemble: {format} ({} files)", members.len()),
                     };
                     *by_media.entry(format!("{media} {action}")).or_default() += 1;
                 }
@@ -631,12 +761,21 @@ async fn run(cli: Cli) -> io::Result<i32> {
                 }
                 if list {
                     for e in &plan.entries {
+                        let action = match &e.action {
+                            Action::Archive { archive } => {
+                                format!("archive: {}", archive.0.display())
+                            }
+                            Action::Assemble {
+                                format, members, ..
+                            } => format!("assemble: {format} ({} files)", members.len()),
+                            _ => format!("{:?}", e.action),
+                        };
                         println!(
-                            "{}: {:?}",
+                            "{}: {}",
                             compressor_core::journal::display_path(&e.path, e.member.as_deref())
                                 .0
                                 .display(),
-                            e.action
+                            action
                         );
                     }
                 }
@@ -746,12 +885,13 @@ async fn run(cli: Cli) -> io::Result<i32> {
                     force_signal.cancel();
                 }
             });
-            let result = run_job_with_envelopes(
+            let result = run_job_with_archives(
                 &plan,
                 &output,
                 &registry(),
                 &pack_registry(),
                 &envelope_registry(),
+                &archive_registry(),
                 jobs,
                 token,
                 force,
@@ -812,6 +952,57 @@ async fn verify(output: &Path) -> io::Result<VerifyResult> {
                     .0
                     .display()
             ));
+        }
+    }
+    for archive in &manifest.plan.entries {
+        let Action::Assemble {
+            format, members, ..
+        } = &archive.action
+        else {
+            continue;
+        };
+        if !manifest
+            .entries
+            .iter()
+            .any(|record| record.path == archive.path && record.outcome == "archived")
+        {
+            continue;
+        }
+        let path = output.join(&archive.path.0);
+        let handler = archive_registry().get(format);
+        let directory = handler
+            .as_ref()
+            .ok_or_else(|| io::Error::other("missing archive format"))
+            .and_then(|h| h.read_directory(&path));
+        for name in members {
+            let label = format!("{}::{name}", archive.path.0.display());
+            let relative = archive.path.0.parent().unwrap_or(Path::new("")).join(name);
+            if std::fs::symlink_metadata(output.join(&relative)).is_ok() {
+                result.errors.push(format!(
+                    "{}: archived file exists loose",
+                    relative.display()
+                ));
+            }
+            let planned = manifest.plan.entries.iter().find(|entry| entry.path.0 == relative && matches!(&entry.action, Action::Archive { archive: target } if target == &archive.path));
+            let checked = match (&handler, &directory, planned) {
+                (Some(handler), Ok(directory), Some(planned)) => directory
+                    .iter()
+                    .find(|item| &item.name == name)
+                    .ok_or_else(|| io::Error::other("member missing"))
+                    .and_then(|item| handler.hash_member(&path, item))
+                    .and_then(|(size, hash)| {
+                        if size == planned.size && hash == planned.hash {
+                            Ok(())
+                        } else {
+                            Err(io::Error::other("hash mismatch"))
+                        }
+                    }),
+                _ => Err(io::Error::other("archive or member missing")),
+            };
+            result.checked += 1;
+            if let Err(error) = checked {
+                result.errors.push(format!("{label}: {error}"));
+            }
         }
     }
     let mut directories = std::collections::HashMap::new();

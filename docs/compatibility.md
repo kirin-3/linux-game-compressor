@@ -113,3 +113,31 @@ The bundled NW.js runtimes of the MV and MZ test games played every converted
 video to its end, including raw AVI and H.264 MP4 sources that the stock runtime
 could not play before conversion. Much older NW.js builds may lack VP9 or Opus
 support, so test video playback in such games before distributing the result.
+
+# Unity standalone players
+
+Windows players using Unity 2020.3.25f1, 2021.3.45f2, and 2022.3.7f1
+were exercised during the archive-format spike. Linux standalone players are
+detected but have not been tested. Unity 2020.1 and later versions in the
+supported version table can have loose player data gathered losslessly into
+`data.unity3d`; unlisted versions are left unchanged unless a newer version is
+explicitly allowed with `--allow-unknown-version`.
+
+Streamed `.resource` files, asset bundles, `Managed/`, `Plugins/`,
+`Resources/`, `StreamingAssets/`, `il2cpp_data/`, configuration, and other game
+files stay loose. Mods and tools that patch loose `.assets` files may require
+`--set engines.unity.archive_data=false`. Already compressed builds, unsupported
+versions, and folders with unreadable player data are copied unchanged;
+archiving can also be disabled through that option.
+
+These are the results on the Windows test builds. The release build ran on 8 cores, and each time covers planning, copying, writing the archive, and checking it:
+
+| Game | Unity version | Input bytes | Output bytes | Saved | Time (seconds) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| UNITY_1 | 2022.3.7f1 | 5,482,269,199 | 1,001,982,445 | 81.7% | 63 |
+| UNITY_2 (Manor) | 2021.3.45f2 | 1,451,345,367 | 1,383,096,945 | 4.7% | 31 |
+| UNITY_3 | 2020.3.25f1 | 5,632,413,603 | 770,886,570 | 86.3% | 57 |
+
+Manor saves little because most of its content is in asset bundles that are already LZ4-compressed.
+
+All three outputs passed `compressor verify`. Under Wine, each player logged that it loaded player data from `data.unity3d` and reached its first screen. Each archive is the same size as the archive from the format spike. The user played the spike's archived builds of UNITY_1 and UNITY_3: both started, played, and had working audio. Manor's archived build was checked headless through a new game, with its music playing.
