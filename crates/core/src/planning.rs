@@ -9,6 +9,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
 };
+use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
 const PLAN_VERSION: u64 = 5;
@@ -35,6 +36,18 @@ pub fn read_manifest(path: &Path) -> io::Result<crate::Manifest> {
 
 /// Hash the bytes of a file or the link text itself, never a symlink's target.
 pub fn hash_input(path: &Path) -> io::Result<(u64, String)> {
+    hash_input_inner(path, None)
+}
+
+fn check_cancel(cancel: Option<&CancellationToken>) -> io::Result<()> {
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
+    Ok(())
+}
+
+fn hash_input_inner(path: &Path, cancel: Option<&CancellationToken>) -> io::Result<(u64, String)> {
+    check_cancel(cancel)?;
     let metadata = fs::symlink_metadata(path)?;
     let mut hasher = blake3::Hasher::new();
     if metadata.file_type().is_symlink() {
@@ -44,6 +57,7 @@ pub fn hash_input(path: &Path) -> io::Result<(u64, String)> {
         let mut file = File::open(path)?;
         let mut buffer = [0u8; 65536];
         loop {
+            check_cancel(cancel)?;
             let n = file.read(&mut buffer)?;
             if n == 0 {
                 break;
@@ -56,6 +70,7 @@ pub fn hash_input(path: &Path) -> io::Result<(u64, String)> {
             "not a regular file or symlink",
         ));
     }
+    check_cancel(cancel)?;
     Ok((metadata.len(), hasher.finalize().to_hex().to_string()))
 }
 
@@ -242,6 +257,24 @@ pub fn build_plan(
 
 /// Reject plans if their input tree or any recorded content has changed.
 pub fn validate_plan(plan: &Plan, root: &Path) -> io::Result<()> {
+    validate_plan_inner(plan, root, None)
+}
+
+/// Validate a plan without writing output, stopping promptly when cancelled.
+pub fn validate_plan_with_cancel(
+    plan: &Plan,
+    root: &Path,
+    cancel: &CancellationToken,
+) -> io::Result<()> {
+    validate_plan_inner(plan, root, Some(cancel))
+}
+
+fn validate_plan_inner(
+    plan: &Plan,
+    root: &Path,
+    cancel: Option<&CancellationToken>,
+) -> io::Result<()> {
+    check_cancel(cancel)?;
     if u64::from(plan.plan_version) != PLAN_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -256,6 +289,7 @@ pub fn validate_plan(plan: &Plan, root: &Path) -> io::Result<()> {
         ));
     }
     for entry in &plan.entries {
+        check_cancel(cancel)?;
         if entry.path.0.as_os_str().is_empty()
             || !entry
                 .path
@@ -332,10 +366,15 @@ pub fn validate_plan(plan: &Plan, root: &Path) -> io::Result<()> {
     let mut actual: Vec<PathBuf> = WalkDir::new(&root)
         .follow_links(false)
         .into_iter()
-        .filter_map(|entry| match entry {
-            Ok(entry) if entry.file_type().is_dir() => None,
-            Ok(entry) => Some(Ok(entry.into_path())),
-            Err(err) => Some(Err(io::Error::other(err))),
+        .filter_map(|entry| {
+            if let Err(err) = check_cancel(cancel) {
+                return Some(Err(err));
+            }
+            match entry {
+                Ok(entry) if entry.file_type().is_dir() => None,
+                Ok(entry) => Some(Ok(entry.into_path())),
+                Err(err) => Some(Err(io::Error::other(err))),
+            }
         })
         .collect::<io::Result<_>>()?;
     actual.sort();
@@ -352,11 +391,13 @@ pub fn validate_plan(plan: &Plan, root: &Path) -> io::Result<()> {
             "plan input file set changed",
         ));
     }
-    plan.entries
+    let result = plan
+        .entries
         .par_iter()
         .filter(|entry| entry.member.is_none() && !matches!(entry.action, Action::Assemble { .. }))
         .try_for_each(|entry| {
-            let (size, hash) = hash_input(&root.join(&entry.path.0))?;
+            check_cancel(cancel)?;
+            let (size, hash) = hash_input_inner(&root.join(&entry.path.0), cancel)?;
             if size != entry.size || hash != entry.hash {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -365,7 +406,9 @@ pub fn validate_plan(plan: &Plan, root: &Path) -> io::Result<()> {
             } else {
                 Ok(())
             }
-        })
+        });
+    check_cancel(cancel)?;
+    result
 }
 
 #[cfg(test)]

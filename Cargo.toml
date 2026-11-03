@@ -1,12 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/media", "crates/engine-renpy", "crates/engine-godot", "crates/engine-rpgm", "crates/engine-unity", "crates/cli", "crates/test-fixtures"]
+members = ["crates/gui", "crates/app", "crates/core", "crates/media", "crates/engine-renpy", "crates/engine-godot", "crates/engine-rpgm", "crates/engine-unity", "crates/cli", "crates/test-fixtures"]
 
 [workspace.package]
 edition = "2021"
 rust-version = "1.88"
 
 [workspace.dependencies]
+eframe = { version = "0.32.3", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "wayland"] }
+directories = "6"
+compressor-app = { path = "crates/app" }
 compressor-core = { path = "crates/core" }
 compressor-media = { path = "crates/media" }
 compressor-engine-renpy = { path = "crates/engine-renpy" }

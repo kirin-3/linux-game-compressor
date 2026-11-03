@@ -10,6 +10,7 @@ name = "compressor"
 path = "src/main.rs"
 
 [dependencies]
+compressor-app.workspace = true
 compressor-core.workspace = true
 compressor-media.workspace = true
 compressor-engine-renpy.workspace = true

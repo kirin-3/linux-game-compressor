@@ -2,7 +2,7 @@ use crate::{
     copy::{self, CopyOutcome},
     journal::{self, Journal, JournalEntry, Report},
     output::check_output,
-    planning::{hash_input, validate_plan},
+    planning::{hash_input, validate_plan_with_cancel},
     registry::{
         ArchiveInput, ArchiveRegistry, EnvelopeRegistry, PackRegistry, TransformerRegistry,
     },
@@ -167,7 +167,10 @@ pub async fn run_job_with_archives(
             "jobs must be positive",
         ));
     }
-    validate_plan(plan, &plan.input_root.0)?;
+    validate_plan_with_cancel(plan, &plan.input_root.0, &cancel)?;
+    if cancel.is_cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
     let output = check_output(&plan.input_root.0, output)?;
     let metadata = output.join(".compressor");
     let existing = if metadata.join("manifest.json").exists() {
@@ -893,6 +896,242 @@ mod tests {
         EngineInfo, MediaKind, ToolSpec,
     };
     use std::{collections::BTreeMap, os::unix::fs::MetadataExt};
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_during_validation_preserves_destinations() -> io::Result<()> {
+        use std::{
+            ffi::CString,
+            os::fd::{AsRawFd, FromRawFd},
+            os::unix::ffi::OsStrExt,
+            time::{Duration, Instant},
+        };
+        let fixture = tempfile::tempdir()?;
+        let input = fixture.path().join("input");
+        std::fs::create_dir(&input)?;
+        let data = input.join("large.dat");
+        std::fs::File::create(&data)?.set_len(1024 * 1024 * 1024)?;
+        let plan = Plan {
+            plan_version: 5,
+            input_root: crate::StoredPath(input.canonicalize()?),
+            engine: EngineInfo {
+                name: "test".into(),
+                version: None,
+                excluded_paths: vec![],
+                notes: vec![],
+                version_check_overridden: false,
+            },
+            settings: crate::ResolvedSettings::default(),
+            tools: vec![],
+            entries: vec![crate::Entry {
+                path: crate::StoredPath("large.dat".into()),
+                member: None,
+                size: 1024 * 1024 * 1024,
+                hash: "unchanged".into(),
+                action: Action::Copy {
+                    reason: "test".into(),
+                },
+            }],
+        };
+        for existing in [false, true] {
+            let output = fixture
+                .path()
+                .join(if existing { "existing" } else { "new" });
+            let plan_bytes = serde_json::to_vec(&plan)?;
+            let record = JournalEntry {
+                path: crate::StoredPath("large.dat".into()),
+                member: None,
+                plan_hash: crate::journal::fingerprint(&plan),
+                input_hash: "unchanged".into(),
+                output_hash: None,
+                input_size: 1024 * 1024 * 1024,
+                output_size: 0,
+                outcome: "pending".into(),
+                failure: false,
+            };
+            let mut journal_bytes = serde_json::to_vec(&record)?;
+            journal_bytes.push(b'\n');
+            if existing {
+                std::fs::create_dir_all(output.join(".compressor"))?;
+                std::fs::write(output.join(".compressor/plan.json"), &plan_bytes)?;
+                std::fs::write(output.join(".compressor/journal.jsonl"), &journal_bytes)?;
+            }
+            let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let watch = unsafe { std::fs::File::from_raw_fd(fd) };
+            let name = CString::new(data.as_os_str().as_bytes()).map_err(io::Error::other)?;
+            if unsafe { libc::inotify_add_watch(watch.as_raw_fd(), name.as_ptr(), libc::IN_OPEN) }
+                < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let token = CancellationToken::new();
+            let signal = token.clone();
+            let watcher = tokio::task::spawn_blocking(move || -> io::Result<Instant> {
+                let mut poll = libc::pollfd {
+                    fd: watch.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let result = unsafe { libc::poll(&mut poll, 1, 5000) };
+                if result != 1 {
+                    return Err(io::Error::other("validation did not open the input"));
+                }
+                let started = Instant::now();
+                signal.cancel();
+                Ok(started)
+            });
+            let input_plan = plan.clone();
+            let target = output.clone();
+            let job = tokio::spawn(async move {
+                let (events, _) = tokio::sync::broadcast::channel(16);
+                run_job_with_archives(
+                    &input_plan,
+                    &target,
+                    &TransformerRegistry::default(),
+                    &PackRegistry::default(),
+                    &EnvelopeRegistry::default(),
+                    &ArchiveRegistry::default(),
+                    1,
+                    token,
+                    CancellationToken::new(),
+                    events,
+                )
+                .await
+            });
+            let cancelled_at = watcher.await.map_err(io::Error::other)??;
+            let result = tokio::time::timeout(Duration::from_secs(2), job)
+                .await
+                .map_err(io::Error::other)?
+                .map_err(io::Error::other)?;
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+            assert!(cancelled_at.elapsed() < Duration::from_secs(2));
+            if existing {
+                assert_eq!(
+                    std::fs::read(output.join(".compressor/plan.json"))?,
+                    plan_bytes
+                );
+                assert_eq!(
+                    std::fs::read(output.join(".compressor/journal.jsonl"))?,
+                    journal_bytes
+                );
+                assert_eq!(
+                    crate::journal::fingerprint(&crate::planning::read_plan(
+                        &output.join(".compressor/plan.json")
+                    )?),
+                    crate::journal::fingerprint(&plan)
+                );
+            } else {
+                assert!(!output.exists());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancellation_during_large_copy_is_prompt_and_resumable() -> io::Result<()> {
+        use std::{
+            ffi::CString,
+            os::fd::{AsRawFd, FromRawFd},
+            os::unix::ffi::OsStrExt,
+            time::{Duration, Instant},
+        };
+        let fixture = tempfile::tempdir()?;
+        let input = fixture.path().join("input");
+        let output = fixture.path().join("output");
+        std::fs::create_dir(&input)?;
+        let source = input.join("large.dat");
+        std::fs::File::create(&source)?.set_len(1024 * 1024 * 1024)?;
+        let (size, hash) = crate::planning::hash_input(&source)?;
+        let plan = Plan {
+            plan_version: 5,
+            input_root: crate::StoredPath(input.canonicalize()?),
+            engine: EngineInfo {
+                name: "test".into(),
+                version: None,
+                excluded_paths: vec![],
+                notes: vec![],
+                version_check_overridden: false,
+            },
+            settings: crate::ResolvedSettings::default(),
+            tools: vec![],
+            entries: vec![crate::Entry {
+                path: crate::StoredPath("large.dat".into()),
+                member: None,
+                size,
+                hash,
+                action: Action::Copy {
+                    reason: "test".into(),
+                },
+            }],
+        };
+        let metadata = output.join(".compressor");
+        std::fs::create_dir_all(metadata.join("tmp"))?;
+        std::fs::write(metadata.join("plan.json"), serde_json::to_vec(&plan)?)?;
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let watch = unsafe { std::fs::File::from_raw_fd(fd) };
+        let name =
+            CString::new(metadata.join("tmp").as_os_str().as_bytes()).map_err(io::Error::other)?;
+        if unsafe { libc::inotify_add_watch(watch.as_raw_fd(), name.as_ptr(), libc::IN_CREATE) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let token = CancellationToken::new();
+        let signal = token.clone();
+        let watcher = tokio::task::spawn_blocking(move || -> io::Result<Instant> {
+            let mut poll = libc::pollfd {
+                fd: watch.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut poll, 1, 15000) } != 1 {
+                return Err(io::Error::other("copy stage was not created"));
+            }
+            let at = Instant::now();
+            signal.cancel();
+            Ok(at)
+        });
+        let target = output.clone();
+        let job_plan = plan.clone();
+        let job = tokio::spawn(async move {
+            let (events, _) = tokio::sync::broadcast::channel(16);
+            run_job_with_archives(
+                &job_plan,
+                &target,
+                &TransformerRegistry::default(),
+                &PackRegistry::default(),
+                &EnvelopeRegistry::default(),
+                &ArchiveRegistry::default(),
+                1,
+                token,
+                CancellationToken::new(),
+                events,
+            )
+            .await
+        });
+        let cancelled_at = watcher.await.map_err(io::Error::other)??;
+        let result = tokio::time::timeout(Duration::from_secs(2), job)
+            .await
+            .map_err(io::Error::other)?
+            .map_err(io::Error::other)?;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(cancelled_at.elapsed() < Duration::from_secs(2));
+        let manifest = crate::planning::read_manifest(&metadata.join("manifest.json"))?;
+        assert!(!manifest.complete);
+        assert_eq!(
+            crate::journal::fingerprint(&manifest.plan),
+            crate::journal::fingerprint(&plan)
+        );
+        assert!(!output.join("large.dat").exists());
+        assert!(!metadata.join("tmp/0.stage").exists());
+        Ok(())
+    }
+
     struct FakeArchive(&'static str, Arc<AtomicUsize>);
     impl crate::registry::ArchiveFormat for FakeArchive {
         fn write(

@@ -1,6 +1,6 @@
 # Game media compressor
 
-A Linux command-line tool for copying a Ren'Py, Godot 4, or RPG Maker MV/MZ game to a separate
+A Linux desktop and command-line tool for copying a Ren'Py, Godot 4, Unity, or RPG Maker MV/MZ game to a separate
 directory while converting eligible images, audio, and video to smaller, validated
 formats. Ren'Py archives are copied unchanged; Godot PCK packs are rebuilt
 when eligible members convert.
@@ -13,6 +13,25 @@ is `webp`. Install `ffmpeg` and `ffprobe` from the `ffmpeg` package with the
 `libopus`, `libvorbis`, `libmp3lame`, and `libvpx-vp9` encoders needed by your plan; transparent video also needs the `libvpx` and `libvpx-vp9` decoders. Install
 Rust 1.88 or newer, then build with `cargo build --release`.
 The binary is `target/release/compressor`.
+
+## Desktop app
+
+Launch the desktop app with `cargo run --release -p compressor-gui`, or run
+`target/release/compressor-gui` after building the workspace. Drag game folders
+onto the window, or use **Add folder**. Choose an output folder to put all games
+there; otherwise each output is created beside its input. Select a game to
+change its profile, settings, verification, or output folder, then press **Start**.
+The queue processes games one at a time and verifies finished outputs by default.
+
+On Linux the app uses X11 when `DISPLAY` is available, including XWayland on
+Wayland desktops, to support folder drops. Without `DISPLAY`, it uses Wayland
+and **Add folder** remains available. Set `COMPRESSOR_GUI_BACKEND=wayland` to
+choose native Wayland; drag and drop is unavailable there.
+
+Preferences are saved in `~/.config/compressor/gui.toml` (or under
+`$XDG_CONFIG_HOME/compressor/gui.toml` when set). The queue is not saved.
+Keep each output's `.compressor/` directory to resume or verify it. Files added
+by hand inside an interrupted output may be replaced when that job resumes.
 
 ## Usage
 

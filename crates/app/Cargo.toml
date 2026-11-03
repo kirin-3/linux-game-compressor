@@ -1,0 +1,22 @@
+[package]
+name = "compressor-app"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+compressor-core.workspace = true
+compressor-media.workspace = true
+compressor-engine-renpy.workspace = true
+compressor-engine-godot.workspace = true
+compressor-engine-rpgm.workspace = true
+compressor-engine-unity.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio-util.workspace = true
+tempfile.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+compressor-test-fixtures = { path = "../test-fixtures" }
