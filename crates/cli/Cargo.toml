@@ -6,10 +6,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "compressor"
-path = "src/main.rs"
-
 [dependencies]
 compressor-app.workspace = true
 compressor-core.workspace = true
@@ -27,8 +23,3 @@ tokio-util.workspace = true
 walkdir.workspace = true
 tempfile.workspace = true
 blake3.workspace = true
-
-[dev-dependencies]
-image.workspace = true
-compressor-test-fixtures = { path = "../test-fixtures" }
-libc.workspace = true

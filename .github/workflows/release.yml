@@ -21,32 +21,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --release --locked -p compressor-cli -p compressor-gui
+        run: cargo build --release --locked -p compressor-gui
       - name: Package
-        id: package
         run: |
-          version=${GITHUB_REF_NAME#v}
-          [ "$GITHUB_REF_TYPE" = tag ] || version=dev-${GITHUB_SHA::7}
-          name=linux-game-compressor-$version-x86_64-linux
-          dir=dist/$name
-          mkdir -p "$dir/bin"
-          cp target/release/compressor target/release/compressor-gui "$dir/bin/"
-          strip "$dir/bin/"*
-          install -Dm644 packaging/linux-game-compressor.desktop \
-            "$dir/share/applications/linux-game-compressor.desktop"
-          install -Dm644 crates/gui/assets/icon-256.png \
-            "$dir/share/icons/hicolor/256x256/apps/linux-game-compressor.png"
-          install -m755 packaging/install.sh "$dir/install.sh"
-          cp README.md LICENSE THIRD_PARTY.md "$dir/"
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
-          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
-          echo "name=$name" >> "$GITHUB_OUTPUT"
+          mkdir dist
+          cp target/release/linux-game-compressor dist/
+          strip dist/linux-game-compressor
+          (cd dist && sha256sum linux-game-compressor > linux-game-compressor.sha256)
       - uses: actions/upload-artifact@v5
         with:
-          name: ${{ steps.package.outputs.name }}
-          path: |
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
+          name: linux-game-compressor-x86_64-linux
+          path: dist/
           retention-days: 1
           if-no-files-found: error
 

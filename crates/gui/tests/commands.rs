@@ -4,7 +4,7 @@ use std::{
     process::{Command, Output},
 };
 fn command(args: &[&str]) -> io::Result<Output> {
-    Command::new(env!("CARGO_BIN_EXE_compressor"))
+    Command::new(env!("CARGO_BIN_EXE_linux-game-compressor"))
         .args(args)
         .output()
 }
@@ -156,7 +156,7 @@ fn cancellation_stops_running_ffmpeg_and_removes_stage() -> io::Result<()> {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_compressor"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_linux-game-compressor"))
         .args([
             "compress",
             str_path(fixture.root()),
@@ -514,7 +514,7 @@ fn interrupts_stop_encoder_group_and_second_interrupt_is_immediate() -> io::Resu
     symlink("/usr/bin/dwebp", tools.join("dwebp"))?;
     let output = temp.path().join("output");
     let pids_file = temp.path().join("pids");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_compressor"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_linux-game-compressor"))
         .args([
             "compress",
             str_path(fixture.root()),
@@ -593,7 +593,7 @@ fn failed_encoder_returns_one_and_keeps_original() -> io::Result<()> {
     std::fs::set_permissions(&encoder, std::fs::Permissions::from_mode(0o755))?;
     symlink("/usr/bin/dwebp", tools.join("dwebp"))?;
     let output = temp.path().join("output");
-    let run = Command::new(env!("CARGO_BIN_EXE_compressor"))
+    let run = Command::new(env!("CARGO_BIN_EXE_linux-game-compressor"))
         .args([
             "compress",
             str_path(fixture.root()),
@@ -627,7 +627,10 @@ fn documented_usage_commands_run() -> io::Result<()> {
     let temp = tempfile::tempdir()?;
     let bin = temp.path().join("bin");
     std::fs::create_dir(&bin)?;
-    symlink(env!("CARGO_BIN_EXE_compressor"), bin.join("compressor"))?;
+    symlink(
+        env!("CARGO_BIN_EXE_linux-game-compressor"),
+        bin.join("linux-game-compressor"),
+    )?;
     let path = format!(
         "{}:{}",
         bin.display(),
@@ -1093,5 +1096,56 @@ fn inspect_unity_fixture() -> io::Result<()> {
     let result = command(&["verify", str_path(&output)])?;
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("Game_Data/data.unity3d"));
+    Ok(())
+}
+
+#[test]
+fn install_and_uninstall_for_the_user() -> io::Result<()> {
+    let home = tempfile::tempdir()?;
+    let run = |arg: &str| {
+        Command::new(env!("CARGO_BIN_EXE_linux-game-compressor"))
+            .arg(arg)
+            .env("HOME", home.path())
+            .env_remove("XDG_DATA_HOME")
+            .output()
+    };
+    let installed = run("install")?;
+    assert!(installed.status.success(), "{installed:?}");
+    let binary = home.path().join(".local/bin/linux-game-compressor");
+    let share = home.path().join(".local/share");
+    assert_eq!(
+        std::fs::read(&binary)?,
+        std::fs::read(env!("CARGO_BIN_EXE_linux-game-compressor"))?
+    );
+    let desktop =
+        std::fs::read_to_string(share.join("applications/linux-game-compressor.desktop"))?;
+    assert!(desktop.contains(&format!("Exec=\"{}\"", binary.display())));
+    assert!(share
+        .join("icons/hicolor/256x256/apps/linux-game-compressor.png")
+        .is_file());
+    // Installing again from the installed copy keeps it in place.
+    let again = Command::new(&binary)
+        .arg("install")
+        .env("HOME", home.path())
+        .env_remove("XDG_DATA_HOME")
+        .output()?;
+    assert!(again.status.success(), "{again:?}");
+    assert!(run("uninstall")?.status.success());
+    assert!(!binary.exists());
+    assert!(!share
+        .join("applications/linux-game-compressor.desktop")
+        .exists());
+    Ok(())
+}
+
+#[test]
+fn licenses_and_help_mention_the_app() -> io::Result<()> {
+    let licenses = command(&["licenses"])?;
+    assert!(licenses.status.success());
+    assert!(String::from_utf8_lossy(&licenses.stdout).contains("GNU GENERAL PUBLIC LICENSE"));
+    let help = command(&["--help"])?;
+    assert!(
+        String::from_utf8_lossy(&help.stdout).contains("without arguments to open the desktop app")
+    );
     Ok(())
 }

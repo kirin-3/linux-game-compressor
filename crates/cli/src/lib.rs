@@ -15,11 +15,14 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod install;
+
 #[derive(Parser)]
 #[command(
-    name = "compressor",
+    name = "linux-game-compressor",
     version,
-    about = "Safely compress loose Ren'Py images"
+    about = "Make Ren'Py, Godot, Unity and RPG Maker games smaller.",
+    after_help = "Run without arguments to open the desktop app."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -27,6 +30,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
+    /// Show effective settings for a game or engine
     Settings {
         #[arg(conflicts_with = "engine")]
         game: Option<PathBuf>,
@@ -39,11 +43,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Detect a game's engine and list its media
     Inspect {
         game: PathBuf,
         #[arg(long)]
         json: bool,
     },
+    /// Show or save what compressing a game would do
     Plan {
         game: PathBuf,
         #[arg(long)]
@@ -57,6 +63,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Compress a game into a separate output folder
     Compress {
         game: PathBuf,
         #[arg(long)]
@@ -72,20 +79,37 @@ enum Commands {
         #[arg(long)]
         allow_unknown_version: bool,
     },
+    /// Check a compressed output against its manifest
     Verify {
         output: PathBuf,
         #[arg(long)]
         json: bool,
     },
+    /// Install this program for the current user, with an app menu entry
+    Install,
+    /// Remove what `install` added
+    Uninstall,
+    /// Print this program's license and third-party licenses
+    Licenses,
 }
 fn print_json<T: serde::Serialize>(value: &T) -> io::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
-#[tokio::main]
-async fn main() {
+/// Runs the command line from the process arguments and returns the exit code.
+pub fn main() -> i32 {
     let cli = Cli::parse();
-    let code = match run(cli).await {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
+    let result = runtime.block_on(run(cli));
+    // Don't wait for detached blocking work; the process is about to exit.
+    runtime.shutdown_background();
+    match result {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e}");
@@ -95,11 +119,16 @@ async fn main() {
                 2
             }
         }
-    };
-    std::process::exit(code);
+    }
 }
 async fn run(cli: Cli) -> io::Result<i32> {
     match cli.command {
+        Commands::Install => install::install().map(|()| 0),
+        Commands::Uninstall => install::uninstall().map(|()| 0),
+        Commands::Licenses => {
+            print!("{}", install::LICENSES);
+            Ok(0)
+        }
         Commands::Settings {
             game,
             engine,

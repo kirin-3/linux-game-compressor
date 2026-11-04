@@ -79,19 +79,24 @@ The app shows a banner if any tool is missing.
 
 ### 2. Get Linux Game Compressor
 
-Download the latest `linux-game-compressor-*-x86_64-linux.tar.gz` from
+Linux Game Compressor is a single file: the desktop app and the command-line
+tool in one. Download `linux-game-compressor` from
 [Releases](https://github.com/kirin-3/linux-game-compressor/releases/latest),
-then:
+then make it executable and run it:
 
 ```sh
-tar xzf linux-game-compressor-*-x86_64-linux.tar.gz
-cd linux-game-compressor-*-x86_64-linux
-./install.sh
+chmod +x linux-game-compressor
+./linux-game-compressor
 ```
 
-This installs `compressor` and `compressor-gui` to `~/.local/bin`, with a
-menu entry and icon. Use `PREFIX=/usr/local sudo -E ./install.sh` to install
-for all users instead.
+To add it to your app menu and your `PATH`, run:
+
+```sh
+./linux-game-compressor install
+```
+
+This copies it to `~/.local/bin` and adds a menu entry and icon.
+`linux-game-compressor uninstall` removes them again.
 
 ### Build from source
 
@@ -103,11 +108,12 @@ cd linux-game-compressor
 cargo build --release
 ```
 
-The binaries are `target/release/compressor` and `target/release/compressor-gui`.
+The program is `target/release/linux-game-compressor`.
 
 ## Desktop app
 
-Open **Linux Game Compressor** from your app menu, or run `compressor-gui`.
+Open **Linux Game Compressor** from your app menu, or run
+`linux-game-compressor` without arguments.
 Drop game folders onto the window or choose **Add games**. The toolbar's **Output** control
 chooses a common output folder; **Reset** returns to placing each output beside
 its input. Choose the default profile and whether finished games are verified,
@@ -139,19 +145,20 @@ by hand inside an interrupted output may be replaced when that job resumes.
 
 ## Command line
 
-Set `GAME` to the input game directory, `OUTPUT` to a separate output path,
-and `PLAN` to a path for a saved plan. With `compressor` on your `PATH`:
+Run `linux-game-compressor --help` for every command. Set `GAME` to the input game directory, `OUTPUT` to a separate output path,
+and `PLAN` to a path for a saved plan. With `linux-game-compressor` on your
+`PATH`:
 
 ```sh
-compressor inspect "$GAME"
-compressor inspect "$GAME" --json
-compressor settings --engine renpy --profile small --set image.quality=70
-compressor settings "$GAME" --json
-compressor plan "$GAME" --profile balanced --list
-compressor plan "$GAME" --profile small --set audio.vorbis_quality=2 --save "$PLAN"
-compressor compress "$GAME" --output "$OUTPUT" --plan "$PLAN" --jobs 2
-compressor verify "$OUTPUT"
-compressor verify "$OUTPUT" --json
+linux-game-compressor inspect "$GAME"
+linux-game-compressor inspect "$GAME" --json
+linux-game-compressor settings --engine renpy --profile small --set image.quality=70
+linux-game-compressor settings "$GAME" --json
+linux-game-compressor plan "$GAME" --profile balanced --list
+linux-game-compressor plan "$GAME" --profile small --set audio.vorbis_quality=2 --save "$PLAN"
+linux-game-compressor compress "$GAME" --output "$OUTPUT" --plan "$PLAN" --jobs 2
+linux-game-compressor verify "$OUTPUT"
+linux-game-compressor verify "$OUTPUT" --json
 ```
 
 `inspect` only reads the game; `plan` writes only the optional saved plan.
@@ -216,7 +223,7 @@ are `video.crf` (0–63), `video.effort` (0–5), and
 For a Godot 4 export, use the same `inspect`, `plan`, `compress`, and `verify`
 commands. Pack members are shown as `pack.pck::member`. Set the minimum
 texture size with `--set engines.godot.min_texture_kib=4` (KiB; default 4).
-For example, `compressor plan "$GAME" --set engines.godot.min_texture_kib=4 --list`
+For example, `linux-game-compressor plan "$GAME" --set engines.godot.min_texture_kib=4 --list`
 shows the affected members. See [compatibility](docs/compatibility.md#godot-4)
 for supported packs and resources.
 
