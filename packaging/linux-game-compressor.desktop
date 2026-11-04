@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Linux Game Compressor
+Comment=Shrink Ren'Py, Godot, Unity and RPG Maker games
+Exec=compressor-gui
+Icon=linux-game-compressor
+Terminal=false
+Categories=Utility;Archiving;Compression;
+Keywords=game;compress;webp;opus;renpy;godot;unity;rpgmaker;
+StartupWMClass=linux-game-compressor

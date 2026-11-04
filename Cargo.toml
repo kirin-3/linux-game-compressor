@@ -5,6 +5,8 @@ members = ["crates/gui", "crates/app", "crates/core", "crates/media", "crates/en
 [workspace.package]
 edition = "2021"
 rust-version = "1.88"
+license = "GPL-3.0-only"
+repository = "https://github.com/kirin-3/linux-game-compressor"
 
 [workspace.dependencies]
 eframe = { version = "0.32.3", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }

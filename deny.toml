@@ -8,7 +8,7 @@ ignore = [
 ]
 
 [licenses]
-# First-party crates have no license selected yet. Audit their dependencies.
+# First-party crates are unpublished (GPL-3.0-only); audit only their dependencies.
 private = { ignore = true }
 allow = [
     "MIT",

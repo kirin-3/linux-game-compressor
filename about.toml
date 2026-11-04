@@ -1,4 +1,4 @@
-# First-party crates are unpublished while the project license is undecided.
+# First-party crates are unpublished (GPL-3.0-only); audit only their dependencies.
 private = { ignore = true }
 accepted = [
     "MIT",

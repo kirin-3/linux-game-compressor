@@ -1,26 +1,114 @@
-<p align="center"><img src="crates/gui/assets/logo.png" width="128" alt=""></p>
+<p align="center">
+  <img src="crates/gui/assets/logo.png" width="128" alt="Linux Game Compressor logo">
+</p>
 
-# Linux Game Compressor
+<h1 align="center">Linux Game Compressor</h1>
 
-A Linux desktop and command-line tool for copying a Ren'Py, Godot 4, Unity, or RPG Maker MV/MZ game to a separate
-directory while converting eligible images, audio, and video to smaller, validated
-formats. Ren'Py archives are copied unchanged; Godot PCK packs are rebuilt
-when eligible members convert.
+<p align="center">
+  Make Ren'Py, Godot, Unity and RPG Maker games smaller without breaking them.
+</p>
+
+<p align="center">
+  <a href="https://github.com/kirin-3/linux-game-compressor/actions/workflows/ci.yml"><img src="https://github.com/kirin-3/linux-game-compressor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/kirin-3/linux-game-compressor/releases/latest"><img src="https://img.shields.io/github/v/release/kirin-3/linux-game-compressor?display_name=tag&sort=semver" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue" alt="License: GPL-3.0"></a>
+</p>
+
+<p align="center">
+  <img src="docs/screenshot.png" alt="The desktop app with four queued games and their estimated sizes">
+</p>
+
+Linux Game Compressor copies a game to a new folder and re-encodes its images,
+audio and video into much smaller formats: images to WebP, audio to
+Opus, Vorbis or MP3, and video to VP9 WebM. Every file keeps its original name
+and path, so the engine loads the output exactly as before. Your original
+game is never modified.
+
+## Features
+
+- **Drop and go.** Drop game folders on the window, press **Start
+  compression**, done. Games are queued and compressed one after another.
+- **Know before you compress.** Each game shows an estimated output size for
+  every profile, worked out in seconds by encoding a sample of its files.
+- **Three simple profiles.** **Best looking**, **Recommended** and
+  **Smallest**, or fine-tune image, audio and video quality per game.
+- **Safe by design.** Output goes to a separate folder and is never
+  overwritten. A file that fails to convert, or wouldn't get smaller, is kept
+  as is. Each output is verified against its manifest when it finishes.
+- **Resumable.** An interrupted job continues where it stopped.
+- **Engine-aware.** Rebuilds Godot `.pck` packs, re-encrypts RPG Maker
+  assets with the game's key, and repacks Unity player data losslessly.
+- **Desktop app and CLI.** The same engine powers both, with identical
+  settings.
+
+## Supported games
+
+| Engine | Versions | What gets compressed |
+| --- | --- | --- |
+| Ren'Py | 6.99.12 and newer | Loose images, audio and video. `.rpa` archives are copied unchanged. |
+| Godot 4 | 4.x | Images and audio, including members of `.pck` packs, which are rebuilt. |
+| RPG Maker MV / MZ | MV and MZ | Images, audio and video, including encrypted assets; unused `.m4a` twins are removed. |
+| Unity | 2020.1 – 2023.2, Unity 6 | Player data repacked into a lossless LZ4HC `data.unity3d`. |
+
+See [docs/compatibility.md](docs/compatibility.md) for results on real games
+and the details for each engine.
 
 ## Install
 
-Install the libwebp command-line tools (`cwebp`, `dwebp`, and `webpinfo`). On
-Arch Linux and CachyOS the package is `libwebp-utils`; on Debian and Ubuntu it
-is `webp`. Install `ffmpeg` and `ffprobe` from the `ffmpeg` package with the
-`libopus`, `libvorbis`, `libmp3lame`, and `libvpx-vp9` encoders needed by your plan; transparent video also needs the `libvpx` and `libvpx-vp9` decoders. Install
-Rust 1.88 or newer, then build with `cargo build --release`.
-The binary is `target/release/compressor`.
+### 1. Install the encoders
+
+Linux Game Compressor uses `cwebp`/`dwebp`/`webpinfo` and `ffmpeg`/`ffprobe`
+(with libvpx-vp9, libopus, libvorbis and libmp3lame).
+
+```sh
+# Arch Linux, CachyOS, Manjaro
+sudo pacman -S libwebp-utils ffmpeg
+```
+
+```sh
+# Debian, Ubuntu, Linux Mint
+sudo apt install webp ffmpeg
+```
+
+```sh
+# Fedora (ffmpeg from RPM Fusion)
+sudo dnf install libwebp-tools ffmpeg
+```
+
+The app shows a banner if any tool is missing.
+
+### 2. Get Linux Game Compressor
+
+Download the latest `linux-game-compressor-*-x86_64-linux.tar.gz` from
+[Releases](https://github.com/kirin-3/linux-game-compressor/releases/latest),
+then:
+
+```sh
+tar xzf linux-game-compressor-*-x86_64-linux.tar.gz
+cd linux-game-compressor-*-x86_64-linux
+./install.sh
+```
+
+This installs `compressor` and `compressor-gui` to `~/.local/bin`, with a
+menu entry and icon. Use `PREFIX=/usr/local sudo -E ./install.sh` to install
+for all users instead.
+
+### Build from source
+
+Install Rust 1.88 or newer, then:
+
+```sh
+git clone https://github.com/kirin-3/linux-game-compressor.git
+cd linux-game-compressor
+cargo build --release
+```
+
+The binaries are `target/release/compressor` and `target/release/compressor-gui`.
 
 ## Desktop app
 
-Launch the desktop app with `cargo run --release -p compressor-gui`, or run
-`target/release/compressor-gui` after building the workspace. Drop game folders
-onto the window or choose **Add games**. The toolbar's **Output** control
+Open **Linux Game Compressor** from your app menu, or run `compressor-gui`.
+Drop game folders onto the window or choose **Add games**. The toolbar's **Output** control
 chooses a common output folder; **Reset** returns to placing each output beside
 its input. Choose the default profile and whether finished games are verified,
 then press **Start compression**. **Stop queue** stops after the current game.
@@ -49,7 +137,7 @@ Preferences are saved in `~/.config/compressor/gui.toml` (or under
 Keep each output's `.compressor/` directory to resume or verify it. Files added
 by hand inside an interrupted output may be replaced when that job resumes.
 
-## Usage
+## Command line
 
 Set `GAME` to the input game directory, `OUTPUT` to a separate output path,
 and `PLAN` to a path for a saved plan. With `compressor` on your `PATH`:
@@ -143,3 +231,35 @@ and resumption then require it to be recreated by a new job.
 
 Exit codes are 0 for success, 1 when some conversions failed and kept their
 originals, 2 for usage or precondition errors, and 130 for interruption.
+
+## How it works
+
+1. **Inspect.** The game's engine and version are detected, and unsupported
+   versions are refused.
+2. **Plan.** Every file is classified as convert, copy or remove. Pack members
+   are planned individually.
+3. **Compress.** The game is copied to the output folder while eligible files
+   are encoded in parallel. Each result is checked, and kept only if it is
+   valid and smaller.
+4. **Verify.** The output is checked against the recorded manifest.
+
+## Contributing
+
+Bug reports and pull requests are welcome. Please run these before sending a
+change:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+To publish a release, push a tag such as `v0.1.0`. The
+[release workflow](.github/workflows/release.yml) builds the Linux package and
+attaches it to a GitHub release.
+
+## License
+
+Linux Game Compressor is licensed under the
+[GNU General Public License v3.0](LICENSE). Licenses of bundled third-party
+crates are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
