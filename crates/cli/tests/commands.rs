@@ -638,6 +638,9 @@ fn documented_usage_commands_run() -> io::Result<()> {
     let readme =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"))?;
     let commands = readme
+        .split("\n## Command line\n")
+        .nth(1)
+        .expect("README has a Command line section")
         .split("```sh\n")
         .nth(1)
         .unwrap()
