@@ -155,6 +155,145 @@ fn decode_duration(path: &Path, alpha: bool, vp8: bool) -> io::Result<u64> {
     Ok((duration_us + 500) / 1000)
 }
 
+fn encode_args(
+    source: &Path,
+    output: &Path,
+    video: &compressor_core::VideoEncode,
+    clip: Option<(f64, f64)>,
+) -> io::Result<Vec<std::ffi::OsString>> {
+    let mut args: Vec<std::ffi::OsString> = ["-nostdin", "-v", "error"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    if video.source.alpha {
+        let probe = video_codec(source)?;
+        args.extend([
+            "-c:v".into(),
+            if probe == "vp8" {
+                "libvpx".into()
+            } else {
+                "libvpx-vp9".into()
+            },
+        ]);
+    }
+    if let Some((start, seconds)) = clip {
+        args.extend(["-ss".into(), start.to_string().into()]);
+        args.extend(["-t".into(), seconds.to_string().into()]);
+    }
+    args.extend(["-i".into(), source.as_os_str().to_owned()]);
+    args.extend(
+        [
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-map_metadata",
+            "-1",
+            "-fps_mode",
+            "passthrough",
+            "-c:v",
+            "libvpx-vp9",
+            "-crf",
+        ]
+        .into_iter()
+        .map(Into::into),
+    );
+    args.push(video.crf.to_string().into());
+    args.extend(
+        ["-b:v", "0", "-deadline", "good", "-cpu-used"]
+            .into_iter()
+            .map(Into::into),
+    );
+    args.push(video.cpu_used.to_string().into());
+    args.extend(
+        ["-row-mt", "1", "-g", "240", "-pix_fmt"]
+            .into_iter()
+            .map(Into::into),
+    );
+    args.push(if video.source.alpha {
+        "yuva420p".into()
+    } else {
+        "yuv420p".into()
+    });
+    if video.source.alpha {
+        args.extend(
+            ["-auto-alt-ref", "0", "-lag-in-frames", "0"]
+                .into_iter()
+                .map(Into::into),
+        );
+    }
+    if let Some(kbps) = video.opus_kbps {
+        args.extend([
+            "-c:a".into(),
+            "libopus".into(),
+            "-b:a".into(),
+            format!("{kbps}k").into(),
+        ]);
+    }
+    args.extend([
+        "-f".into(),
+        "webm".into(),
+        "-y".into(),
+        output.as_os_str().to_owned(),
+    ]);
+    Ok(args)
+}
+
+/// Encode a time-limited sample with the same settings as a full conversion.
+pub async fn encode_clip(
+    source: &Path,
+    settings: &compressor_core::VideoEncode,
+    start: f64,
+    seconds: f64,
+    out: &Path,
+) -> io::Result<()> {
+    encode_clip_with_cancel(
+        source,
+        settings,
+        start,
+        seconds,
+        out,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+pub async fn encode_clip_with_cancel(
+    source: &Path,
+    settings: &compressor_core::VideoEncode,
+    start: f64,
+    seconds: f64,
+    out: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> io::Result<()> {
+    if !start.is_finite() || start < 0.0 || !seconds.is_finite() || seconds <= 0.0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid clip range",
+        ));
+    }
+    let source = source.to_owned();
+    let out = out.to_owned();
+    let settings = settings.clone();
+    let args = tokio::task::spawn_blocking(move || {
+        encode_args(&source, &out, &settings, Some((start, seconds)))
+    })
+    .await
+    .map_err(io::Error::other)??;
+    let result =
+        compressor_core::process::run_process("ffmpeg".as_ref(), args, cancel, cancel).await?;
+    if result.cancelled {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
+    if !result.status.success() {
+        return Err(io::Error::other(format!(
+            "ffmpeg: {}",
+            String::from_utf8_lossy(&result.stderr)
+        )));
+    }
+    Ok(())
+}
+
 pub struct VideoTransformer;
 impl compressor_core::registry::Transformer for VideoTransformer {
     fn kind(&self) -> compressor_core::MediaKind {
@@ -216,80 +355,13 @@ impl compressor_core::registry::Transformer for VideoTransformer {
             let compressor_core::ConvertSettings::Video(video) = settings else {
                 return Err(io::Error::other("expected video settings"));
             };
-            let mut args: Vec<std::ffi::OsString> = ["-nostdin", "-v", "error"]
-                .into_iter()
-                .map(Into::into)
-                .collect();
-            if video.source.alpha {
-                let source_path = source.to_owned();
-                let probe = tokio::task::spawn_blocking(move || video_codec(&source_path))
+            let source = source.to_owned();
+            let output = output.to_owned();
+            let video = video.clone();
+            let args =
+                tokio::task::spawn_blocking(move || encode_args(&source, &output, &video, None))
                     .await
                     .map_err(io::Error::other)??;
-                args.extend([
-                    "-c:v".into(),
-                    if probe == "vp8" {
-                        "libvpx".into()
-                    } else {
-                        "libvpx-vp9".into()
-                    },
-                ]);
-            }
-            args.extend(["-i".into(), source.as_os_str().to_owned()]);
-            args.extend(
-                [
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "0:a:0?",
-                    "-map_metadata",
-                    "-1",
-                    "-fps_mode",
-                    "passthrough",
-                    "-c:v",
-                    "libvpx-vp9",
-                    "-crf",
-                ]
-                .into_iter()
-                .map(Into::into),
-            );
-            args.push(video.crf.to_string().into());
-            args.extend(
-                ["-b:v", "0", "-deadline", "good", "-cpu-used"]
-                    .into_iter()
-                    .map(Into::into),
-            );
-            args.push(video.cpu_used.to_string().into());
-            args.extend(
-                ["-row-mt", "1", "-g", "240", "-pix_fmt"]
-                    .into_iter()
-                    .map(Into::into),
-            );
-            args.push(if video.source.alpha {
-                "yuva420p".into()
-            } else {
-                "yuv420p".into()
-            });
-            if video.source.alpha {
-                args.extend(
-                    ["-auto-alt-ref", "0", "-lag-in-frames", "0"]
-                        .into_iter()
-                        .map(Into::into),
-                );
-            }
-            if let Some(kbps) = video.opus_kbps {
-                args.extend([
-                    "-c:a".into(),
-                    "libopus".into(),
-                    "-b:a".into(),
-                    format!("{kbps}k").into(),
-                ]);
-            }
-            args.extend([
-                "-f".into(),
-                "webm".into(),
-                "-y".into(),
-                output.as_os_str().to_owned(),
-            ]);
             let result =
                 compressor_core::process::run_process("ffmpeg".as_ref(), args, cancel, force)
                     .await?;
@@ -425,6 +497,48 @@ fn audio_codec(path: &Path) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn clip_uses_full_encode_settings_and_has_requested_duration() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("long.mp4");
+        assert!(Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=64x48:rate=10:duration=30",
+                "-c:v",
+                "libx264",
+                "-y"
+            ])
+            .arg(&source)
+            .status()?
+            .success());
+        let settings = compressor_core::VideoEncode {
+            crf: 36,
+            cpu_used: 2,
+            opus_kbps: None,
+            source: probe(&source)?,
+        };
+        let out = dir.path().join("clip.webm");
+        let full_args = encode_args(&source, &out, &settings, None)?;
+        let mut clip_args = encode_args(&source, &out, &settings, Some((12.0, 8.0)))?;
+        let index = clip_args.iter().position(|a| a == "-ss").unwrap();
+        clip_args.drain(index..index + 4);
+        assert_eq!(full_args, clip_args);
+        encode_clip(&source, &settings, 12.0, 8.0, &out).await?;
+        let props = probe(&out)?;
+        assert!(
+            (7900..=8100).contains(&props.duration_ms),
+            "{}",
+            props.duration_ms
+        );
+        assert_eq!(video_codec(&out)?, "vp9");
+        Ok(())
+    }
     fn generate(path: &Path, options: &[&str]) -> io::Result<()> {
         let status = Command::new("ffmpeg")
             .args([

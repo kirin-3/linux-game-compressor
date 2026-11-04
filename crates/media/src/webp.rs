@@ -171,7 +171,7 @@ impl Transformer for WebpTransformer {
             ) {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "animated image"));
             }
-            let pam = tempfile::NamedTempFile::new()?;
+            let pam = tempfile::NamedTempFile::new_in(output.parent().unwrap_or(Path::new(".")))?;
             let args = [
                 std::ffi::OsStr::new("-quiet"),
                 std::ffi::OsStr::new("-pam"),

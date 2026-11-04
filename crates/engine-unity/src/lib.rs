@@ -688,6 +688,59 @@ impl UnityFs {
     }
 }
 impl ArchiveFormat for UnityFs {
+    fn estimate_ratio(
+        &self,
+        inputs: &[ArchiveInput],
+        sample_blocks: usize,
+        cancel: &CancellationToken,
+    ) -> io::Result<Option<f64>> {
+        const BLOCK: u64 = 131_072;
+        let total = inputs
+            .iter()
+            .try_fold(0u64, |sum, input| sum.checked_add(input.size))
+            .ok_or_else(|| invalid("archive size overflow"))?;
+        if total == 0 || sample_blocks == 0 {
+            return Ok(None);
+        }
+        let blocks = total.div_ceil(BLOCK);
+        let count = blocks.min(sample_blocks as u64);
+        let mut raw_total = 0u64;
+        let mut encoded_total = 0u64;
+        for index in 0..count {
+            if cancel.is_cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            }
+            let block = if count == 1 {
+                0
+            } else {
+                index * (blocks - 1) / (count - 1)
+            };
+            let mut offset = block * BLOCK;
+            let mut remaining = BLOCK.min(total - offset);
+            let mut data = Vec::with_capacity(remaining as usize);
+            for input in inputs {
+                if offset >= input.size {
+                    offset -= input.size;
+                    continue;
+                }
+                let n = remaining.min(input.size - offset);
+                let mut file = File::open(&input.path)?;
+                file.seek(SeekFrom::Start(offset))?;
+                let start = data.len();
+                data.resize(start + n as usize, 0);
+                file.read_exact(&mut data[start..])?;
+                remaining -= n;
+                offset = 0;
+                if remaining == 0 {
+                    break;
+                }
+            }
+            let encoded = compress(&data, 9)?;
+            raw_total += data.len() as u64;
+            encoded_total += encoded.len().min(data.len()) as u64;
+        }
+        Ok(Some(encoded_total as f64 / raw_total as f64))
+    }
     fn write(
         &self,
         members: &[ArchiveInput],
@@ -1022,6 +1075,15 @@ mod tests {
             let params = serde_json::json!({"format_version":version,"unity_revision":"2021.3.45f2","block_padding":version == 8,"block_size":131072,"lz4hc_level":9});
             UnityFs.write(&inputs, &out, &params, &CancellationToken::new())?;
             let data = std::fs::read(&out)?;
+            let ratio = UnityFs
+                .estimate_ratio(&inputs, 32, &CancellationToken::new())?
+                .unwrap();
+            let actual =
+                data.len() as f64 / inputs.iter().map(|input| input.size).sum::<u64>() as f64;
+            assert!(
+                (ratio - actual).abs() < 0.05,
+                "estimated {ratio}, actual {actual}"
+            );
             assert_eq!(&data[..8], b"UnityFS\0");
             assert_eq!(&data[8..12], &(version as u32).to_be_bytes());
             let mut cursor = std::io::Cursor::new(&data[12..]);

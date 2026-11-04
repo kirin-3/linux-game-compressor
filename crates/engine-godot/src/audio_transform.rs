@@ -70,8 +70,8 @@ impl Transformer for GodotAudioTransformer {
         Box::pin(async move {
             let resource = crate::resource::Resource::parse(&std::fs::read(src)?)?;
             let (index, audio) = extract(&resource)?;
-            let input = tempfile::NamedTempFile::new()?;
-            let output = tempfile::NamedTempFile::new()?;
+            let input = tempfile::NamedTempFile::new_in(dst.parent().unwrap_or(Path::new(".")))?;
+            let output = tempfile::NamedTempFile::new_in(dst.parent().unwrap_or(Path::new(".")))?;
             std::fs::write(input.path(), audio)?;
             let inner = compressor_media::audio::AudioTransformer;
             let note = inner
@@ -143,7 +143,7 @@ impl Transformer for GodotAudioTransformer {
                 }
             }
             let (_, audio) = extract(&after).map_err(|_| io::Error::other("decode failed"))?;
-            let file = tempfile::NamedTempFile::new()?;
+            let file = tempfile::NamedTempFile::new_in(dst.parent().unwrap_or(Path::new(".")))?;
             std::fs::write(file.path(), audio)?;
             compressor_media::audio::AudioTransformer::validate_output(
                 file.path(),

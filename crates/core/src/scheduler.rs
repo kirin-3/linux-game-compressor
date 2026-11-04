@@ -16,23 +16,48 @@ pub(crate) async fn transform_enveloped(
     transformer: Arc<dyn crate::registry::Transformer>,
     envelope: Arc<dyn crate::registry::EnvelopeFormat>,
     params: serde_json::Value,
+    staged: io::Result<PathBuf>,
     cancel: &CancellationToken,
     force: &CancellationToken,
 ) -> io::Result<ConversionOutcome> {
-    let plain = temporary.with_extension("payload.src");
-    let wrapped = temporary.with_extension("wrapped");
-    let original = tokio::fs::read(&source).await?;
-    let result: io::Result<ConversionOutcome> = async {
-        let payload = match envelope.unwrap(&original, &params) {
-            Ok(data) => data,
-            Err(e) => {
-                return Ok(ConversionOutcome::KeptOriginal {
-                    reason: format!("unwrap failed: {e}"),
-                    failed: true,
-                })
+    let plain = match staged {
+        Ok(path) => path,
+        Err(e) => {
+            if !e
+                .get_ref()
+                .is_some_and(|cause| cause.is::<crate::planning::EnvelopeUnwrapError>())
+            {
+                return Err(e);
             }
-        };
-        tokio::fs::write(&plain, payload).await?;
+            if cancel.is_cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            }
+            let original = tokio::fs::read(&source).await?;
+            if let Some(parent) = destination.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&temporary, original).await?;
+            if cancel.is_cancelled() {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            }
+            crate::copy::preserve_metadata(&source, &temporary)?;
+            tokio::fs::rename(&temporary, &destination).await?;
+            return Ok(ConversionOutcome::KeptOriginal {
+                reason: format!("unwrap failed: {e}"),
+                failed: true,
+            });
+        }
+    };
+    let wrapped = temporary.with_extension("wrapped");
+    let original = match tokio::fs::read(&source).await {
+        Ok(original) => original,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&plain).await;
+            return Err(error);
+        }
+    };
+    let result: io::Result<ConversionOutcome> = async {
         let note = match transformer
             .transform_with_force(&plain, &temporary, &settings, cancel, force)
             .await
@@ -200,6 +225,43 @@ mod tests {
         active: AtomicUsize,
         max: AtomicUsize,
         started: AtomicUsize,
+    }
+    struct PassthroughEnvelope;
+    impl crate::registry::EnvelopeFormat for PassthroughEnvelope {
+        fn unwrap(&self, data: &[u8], _: &serde_json::Value) -> io::Result<Vec<u8>> {
+            Ok(data.to_vec())
+        }
+        fn wrap(&self, data: &[u8], _: &serde_json::Value) -> io::Result<Vec<u8>> {
+            Ok(data.to_vec())
+        }
+    }
+    #[tokio::test]
+    async fn envelope_staging_io_failure_does_not_write_a_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        std::fs::write(&source, b"original").unwrap();
+        let transformer = Arc::new(Fake {
+            active: AtomicUsize::new(0),
+            max: AtomicUsize::new(0),
+            started: AtomicUsize::new(0),
+        });
+        let token = CancellationToken::new();
+        let result = transform_enveloped(
+            source,
+            destination.clone(),
+            dir.path().join("stage"),
+            ConvertSettings::Image(ResolvedSettings::default().image()),
+            transformer,
+            Arc::new(PassthroughEnvelope),
+            serde_json::json!({}),
+            Err(io::Error::other("staging disk error")),
+            &token,
+            &token,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().to_string(), "staging disk error");
+        assert!(!destination.exists());
     }
     impl Transformer for Fake {
         fn kind(&self) -> MediaKind {

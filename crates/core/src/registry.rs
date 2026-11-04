@@ -133,6 +133,15 @@ pub struct ArchiveInput {
 }
 
 pub trait ArchiveFormat: Send + Sync {
+    /// Estimate compressed bytes divided by input bytes when supported.
+    fn estimate_ratio(
+        &self,
+        _inputs: &[ArchiveInput],
+        _sample_blocks: usize,
+        _cancel: &CancellationToken,
+    ) -> io::Result<Option<f64>> {
+        Ok(None)
+    }
     fn write(
         &self,
         members: &[ArchiveInput],
@@ -171,7 +180,7 @@ pub trait EnvelopeFormat: Send + Sync {
     fn wrap(&self, payload: &[u8], params: &serde_json::Value) -> io::Result<Vec<u8>>;
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct EnvelopeRegistry(HashMap<String, Arc<dyn EnvelopeFormat>>);
 impl EnvelopeRegistry {
     pub fn register(&mut self, format: &str, handler: Arc<dyn EnvelopeFormat>) {
@@ -182,7 +191,7 @@ impl EnvelopeRegistry {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PackRegistry(HashMap<String, Arc<dyn PackFormat>>);
 impl PackRegistry {
     pub fn register(&mut self, format: &str, handler: Arc<dyn PackFormat>) {

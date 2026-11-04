@@ -190,6 +190,9 @@ pub async fn run_job_with_archives(
         }
     }
     // Cache each source directory once; reject malformed plans before creating output.
+    let shared_plan = Arc::new(plan.clone());
+    let shared_packs = packs.clone();
+    let shared_envelopes = envelopes.clone();
     let mut pack_dirs = HashMap::new();
     for entry in &plan.entries {
         if let Action::Assemble { format, .. } = &entry.action {
@@ -298,6 +301,9 @@ pub async fn run_job_with_archives(
             )
         });
         let entry = entry.clone();
+        let stage_plan = shared_plan.clone();
+        let stage_packs = shared_packs.clone();
+        let stage_envelopes = shared_envelopes.clone();
         let root = plan.input_root.0.clone();
         let output = output.clone();
         let temporary = metadata.join("tmp").join(format!("{index}.stage"));
@@ -318,18 +324,19 @@ pub async fn run_job_with_archives(
             });
             let path = entry.path.clone();
             let action = async {
-                if let Some((handler, member)) = pack_member {
+                if let Some((pack, member)) = pack_member {
                     let source = temporary.with_extension("src");
                     let destination = output.join(".compressor/members").join(index.to_string());
                     let (outcome, failure, hash, size) = match (&entry.action, transformer) {
                         (Action::Convert { settings, .. }, Some(t)) => {
-                            let bytes = handler.read_member(&root.join(&path.0), &member)?;
+                            let bytes = pack.read_member(&root.join(&path.0), &member)?;
                             if bytes.len() as u64 != entry.size || blake3::hash(&bytes).to_hex().as_str() != entry.hash {
                                 return Err(io::Error::new(io::ErrorKind::InvalidData, "stale pack member"));
                             }
+                            let staged = envelope.as_ref().map(|_| crate::planning::stage_bytes(bytes.clone(), &entry.action, &stage_envelopes, temporary.parent().unwrap()));
                             tokio::fs::write(&source, bytes).await?;
-                            let result = if let Some((handler, params)) = envelope {
-                                crate::scheduler::transform_enveloped(source.clone(), destination.clone(), temporary.clone(), settings.clone(), t, handler, params, &token, &force).await
+                            let result = if let (Some((handler, params)), Some(staged)) = (envelope, staged) {
+                                crate::scheduler::transform_enveloped(source.clone(), destination.clone(), temporary.clone(), settings.clone(), t, handler, params, staged, &token, &force).await
                             } else {
                                 transform_one_with_force(source.clone(), destination.clone(), temporary.clone(), settings.clone(), t, &token, &force).await
                             };
@@ -353,8 +360,10 @@ pub async fn run_job_with_archives(
                     let destination=output.join(&path.0); ensure_output_parent(&output, &path.0)?;
                     let (outcome, failure, exists) = match (&entry.action, transformer) {
                         (Action::Convert { settings, .. }, Some(t)) => match if let Some((handler, params)) = envelope {
-                            crate::scheduler::transform_enveloped(root.join(&path.0), destination.clone(), temporary.clone(), settings.clone(), t, handler, params, &token, &force).await?
-                        } else { transform_one_with_force(root.join(&path.0), destination.clone(), temporary.clone(), settings.clone(), t, &token, &force).await? } {
+                            crate::scheduler::transform_enveloped(root.join(&path.0), destination.clone(), temporary.clone(), settings.clone(), t, handler, params, crate::planning::stage_entry_source(&root, &stage_plan, &entry, &stage_packs, &stage_envelopes, temporary.parent().unwrap()), &token, &force).await?
+                        } else {
+                            transform_one_with_force(root.join(&path.0), destination.clone(), temporary.clone(), settings.clone(), t, &token, &force).await?
+                        } {
                             ConversionOutcome::Converted { note } => (note.map_or_else(|| "converted".to_owned(), |n| format!("converted; {n}")), false, true),
                             ConversionOutcome::KeptOriginal { reason, failed } => (reason, failed, true),
                         },
@@ -1633,6 +1642,99 @@ mod tests {
             std::fs::copy(&replacements["member"], output)?;
             Ok(())
         }
+    }
+    #[test]
+    fn stage_sources_and_reject_invalid_pack_parent() -> io::Result<()> {
+        use crate::registry::EnvelopeFormat;
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        std::fs::write(root.join("loose"), b"loose bytes")?;
+        std::fs::write(
+            root.join("wrapped"),
+            XorEnvelope.wrap(b"payload", &serde_json::json!({}))?,
+        )?;
+        std::fs::write(root.join("pack"), b"pack")?;
+        let settings = crate::ResolvedSettings::default();
+        let convert = |envelope| Action::Convert {
+            kind: MediaKind::Image,
+            target: "fake".into(),
+            encoder: "fake".into(),
+            settings: crate::ConvertSettings::Image(settings.image()),
+            envelope,
+        };
+        let entry = |name: &str, member, action| crate::Entry {
+            path: StoredPath(name.into()),
+            member,
+            size: 0,
+            hash: String::new(),
+            action,
+        };
+        let loose = entry("loose", None, convert(None));
+        let wrapped = entry(
+            "wrapped",
+            None,
+            convert(Some(crate::Envelope {
+                format: "xor".into(),
+                params: serde_json::json!({}),
+            })),
+        );
+        let member = entry("pack", Some("member".into()), convert(None));
+        let parent = entry(
+            "pack",
+            None,
+            Action::Rebuild {
+                format: "fake".into(),
+            },
+        );
+        let mut plan = Plan {
+            plan_version: 5,
+            input_root: StoredPath(root.into()),
+            engine: EngineInfo {
+                name: "fake".into(),
+                version: None,
+                excluded_paths: vec![],
+                notes: vec![],
+                version_check_overridden: false,
+            },
+            settings,
+            tools: vec![],
+            entries: vec![parent, member.clone()],
+        };
+        let mut packs = PackRegistry::default();
+        packs.register("fake", Arc::new(FakePack { fail: false }));
+        let mut envelopes = EnvelopeRegistry::default();
+        envelopes.register("xor", Arc::new(XorEnvelope));
+        for (entry, expected) in [
+            (&loose, &b"loose bytes"[..]),
+            (&wrapped, &b"payload"[..]),
+            (&member, &b"a long member source"[..]),
+        ] {
+            let staged =
+                crate::planning::stage_entry_source(root, &plan, entry, &packs, &envelopes, root)?;
+            assert_eq!(std::fs::read(&staged)?, expected);
+            std::fs::remove_file(staged)?;
+        }
+        plan.entries.remove(0);
+        assert_eq!(
+            crate::planning::stage_entry_source(root, &plan, &member, &packs, &envelopes, root)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        plan.entries.push(entry(
+            "pack",
+            None,
+            Action::Copy {
+                reason: "test".into(),
+            },
+        ));
+        assert_eq!(
+            crate::planning::stage_entry_source(root, &plan, &member, &packs, &envelopes, root)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        Ok(())
     }
     #[tokio::test]
     async fn packs_rebuild_or_preserve_original() -> io::Result<()> {

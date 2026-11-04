@@ -39,6 +39,116 @@ pub fn hash_input(path: &Path) -> io::Result<(u64, String)> {
     hash_input_inner(path, None)
 }
 
+#[derive(Debug)]
+pub(crate) struct EnvelopeUnwrapError(io::Error);
+impl std::fmt::Display for EnvelopeUnwrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for EnvelopeUnwrapError {}
+
+/// Materialize the bytes seen by a transformer, without writing to the game.
+pub fn stage_entry_source(
+    root: &Path,
+    plan: &Plan,
+    entry: &Entry,
+    packs: &crate::registry::PackRegistry,
+    envelopes: &crate::registry::EnvelopeRegistry,
+    dir: &Path,
+) -> io::Result<PathBuf> {
+    let input = root.join(&entry.path.0);
+    if entry.member.is_none()
+        && !matches!(
+            &entry.action,
+            Action::Convert {
+                envelope: Some(_),
+                ..
+            }
+        )
+    {
+        let file = tempfile::Builder::new()
+            .prefix("source-")
+            .tempfile_in(dir)?;
+        fs::copy(&input, file.path())?;
+        crate::copy::preserve_metadata(&input, file.path())?;
+        let (_, path) = file.keep().map_err(|e| e.error)?;
+        return Ok(path);
+    }
+    let bytes = if let Some(name) = &entry.member {
+        let parent = plan
+            .entries
+            .iter()
+            .find(|e| e.path == entry.path && e.member.is_none());
+        let Some(Action::Rebuild { format }) = parent.map(|e| &e.action) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "member has no rebuild entry",
+            ));
+        };
+        let handler = packs.get(format).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("missing pack format: {format}"),
+            )
+        })?;
+        let member = handler
+            .read_directory(&input)?
+            .into_iter()
+            .find(|m| &m.name == name)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "member missing from pack")
+            })?;
+        let bytes = handler.read_member(&input, &member)?;
+        if !entry.hash.is_empty()
+            && (bytes.len() as u64 != entry.size
+                || blake3::hash(&bytes).to_hex().as_str() != entry.hash)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stale pack member",
+            ));
+        }
+        bytes
+    } else {
+        fs::read(&input)?
+    };
+    stage_bytes(bytes, &entry.action, envelopes, dir)
+}
+
+/// Write an entry's raw bytes to `dir`, unwrapping its envelope when it has one.
+pub(crate) fn stage_bytes(
+    bytes: Vec<u8>,
+    action: &Action,
+    envelopes: &crate::registry::EnvelopeRegistry,
+    dir: &Path,
+) -> io::Result<PathBuf> {
+    let bytes = if let Action::Convert {
+        envelope: Some(envelope),
+        ..
+    } = action
+    {
+        let handler = envelopes.get(&envelope.format).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("missing envelope format: {}", envelope.format),
+            )
+        })?;
+        handler
+            .unwrap(&bytes, &envelope.params)
+            .map_err(|error| io::Error::new(error.kind(), EnvelopeUnwrapError(error)))?
+    } else {
+        bytes
+    };
+    let mut file = tempfile::Builder::new()
+        .prefix("source-")
+        .tempfile_in(dir)?;
+    use std::io::Write;
+    file.write_all(&bytes)?;
+    let (_, path) = file.keep().map_err(|e| e.error)?;
+    Ok(path)
+}
+
 fn check_cancel(cancel: Option<&CancellationToken>) -> io::Result<()> {
     if cancel.is_some_and(CancellationToken::is_cancelled) {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
@@ -77,9 +187,32 @@ fn hash_input_inner(path: &Path, cancel: Option<&CancellationToken>) -> io::Resu
 pub fn build_plan(
     root: &Path,
     adapter: &dyn EngineAdapter,
+    engine: EngineInfo,
+    settings: ResolvedSettings,
+    transformers: &TransformerRegistry,
+) -> io::Result<Plan> {
+    plan_inner(root, adapter, engine, settings, transformers, true)
+}
+
+/// Build a non-executable preview without hashing loose input files.
+/// Pack adapters may still hash members while expanding their directories.
+pub fn preview_plan(
+    root: &Path,
+    adapter: &dyn EngineAdapter,
+    engine: EngineInfo,
+    settings: ResolvedSettings,
+    transformers: &TransformerRegistry,
+) -> io::Result<Plan> {
+    plan_inner(root, adapter, engine, settings, transformers, false)
+}
+
+fn plan_inner(
+    root: &Path,
+    adapter: &dyn EngineAdapter,
     mut engine: EngineInfo,
     settings: ResolvedSettings,
     transformers: &TransformerRegistry,
+    hash_files: bool,
 ) -> io::Result<Plan> {
     let root = root.canonicalize()?;
     let archives = adapter.archives(&root, &engine, &settings)?;
@@ -96,7 +229,18 @@ pub fn build_plan(
         .par_iter()
         .map(|path| {
             let relative = path.strip_prefix(&root).map_err(io::Error::other)?;
-            let (size, hash) = hash_input(path)?;
+            let (size, hash) = if hash_files {
+                hash_input(path)?
+            } else {
+                let metadata = fs::symlink_metadata(path)?;
+                if !metadata.is_file() && !metadata.file_type().is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "not a regular file or symlink",
+                    ));
+                }
+                (metadata.len(), String::new())
+            };
             let mut action = adapter.classify(&root, relative, &engine, &settings)?;
             let members = adapter.expand(&root, relative, &engine, &settings)?;
             let mut expanded = Vec::new();

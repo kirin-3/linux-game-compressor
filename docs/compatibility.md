@@ -141,3 +141,25 @@ These are the results on the Windows test builds. The release build ran on 8 cor
 Manor saves little because most of its content is in asset bundles that are already LZ4-compressed.
 
 All three outputs passed `compressor verify`. Under Wine, each player logged that it loaded player data from `data.unity3d` and reached its first screen. Each archive is the same size as the archive from the format spike. The user played the spike's archived builds of UNITY_1 and UNITY_3: both started, played, and had working audio. Manor's archived build was checked headless through a new game, with its music playing.
+
+# Desktop size estimates
+
+Measured with the three built-in profiles and the balanced compression on the example games. Values are MiB; each estimate is the likely value followed by its low–high range. Measurements use 24 image, 48 audio, and 3 video samples, with eight-second video clips.
+
+| Game | Recommended estimate (range) | Best looking estimate (range) | Smallest estimate (range) | Actual balanced |
+|---|---:|---:|---:|---:|
+| GODOT_1 | 340.84 (309.02–372.66) | 372.68 (340.99–404.36) | 321.02 (292.07–349.97) | 346.33 |
+| GODOT_2 | 156.19 (156.05–156.33) | 178.00 (178.00–178.00) | 144.27 (144.16–144.38) | 156.74 |
+| MV_1 | 867.48 (805.02–929.94) | 994.11 (936.69–1,051.53) | 701.23 (646.03–756.42) | 848.91 |
+| MV_2 | 314.49 (289.06–339.91) | 346.31 (321.75–370.88) | 281.05 (255.53–306.57) | 316.05 |
+| MZ_1 | 267.09 (262.19–271.99) | 270.93 (266.16–275.70) | 264.33 (259.82–268.84) | 268.05 |
+| MZ_2 | 418.82 (388.32–449.32) | 466.80 (432.88–500.73) | 392.92 (363.51–422.33) | 416.81 |
+| RENPY_1 | 410.72 (311.42–510.02) | 466.83 (356.30–577.35) | 329.02 (245.00–413.05) | 414.98 |
+| RENPY_2 | 581.04 (581.04–581.04) | 581.04 (581.04–581.04) | 581.04 (581.04–581.04) | 581.04 |
+| UNITY_1 | 993.04 (993.04–993.04) | 993.04 (993.04–993.04) | 993.04 (993.04–993.04) | 955.56 |
+| UNITY_2 | 1,317.26 (1,317.26–1,317.26) | 1,317.26 (1,317.26–1,317.26) | 1,317.26 (1,317.26–1,317.26) | 1,319.02 |
+| UNITY_3 | 783.40 (783.40–783.40) | 783.40 (783.40–783.40) | 783.40 (783.40–783.40) | 735.17 |
+
+GODOT_2 finished 0.41 MiB above the balanced upper bound: sampled media ratios and the rebuilt embedded pack’s overhead did not exactly represent the complete pack. The Unity balanced results fell outside their zero-width ranges because the 32 sampled LZ4HC blocks did not represent the entire player-data archive: UNITY_1 and UNITY_3 compressed better than sampled, while UNITY_2 compressed slightly worse. Archive sampling currently contributes no uncertainty to the range, so these results show that a zero-width range does not imply an exact archive size.
+
+The initial 12-file audio sample on MV_1 overestimated the balanced output; increasing the audio limit to 48 brought its actual result inside the range. Full runs completed with no conversion failures. Estimates are read-only and are not guarantees of the resulting size.

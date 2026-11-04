@@ -1,3 +1,5 @@
+pub mod estimate;
+pub mod sample_limiter;
 use compressor_core::{
     planning::{build_plan, hash_input},
     registry::{
@@ -7,6 +9,7 @@ use compressor_core::{
 };
 use compressor_engine_renpy::RenpyAdapter;
 use compressor_media::{audio::AudioTransformer, webp::WebpTransformer, MediaCount};
+pub use estimate::{estimate, Estimate, EstimateOptions};
 use std::{
     collections::BTreeMap,
     io,
@@ -271,6 +274,9 @@ pub struct InspectResult {
     pub rpgmaker: Option<RpgMakerInfo>,
     pub unity: Vec<UnityInfo>,
     pub media: BTreeMap<String, MediaCount>,
+    /// Additional GUI classification; omitted from the existing CLI inspection output.
+    #[serde(skip)]
+    pub encrypted_media: BTreeMap<String, MediaCount>,
     pub archives: Vec<(String, u64)>,
     pub packs: Vec<PackInfo>,
     pub tools: Vec<(String, bool, BTreeMap<String, bool>)>,
@@ -362,6 +368,7 @@ pub fn inspect(game: &Path) -> io::Result<InspectResult> {
     let rpgmaker = inspect_rpgmaker(&plan)?;
     let unity = inspect_unity(&plan)?;
     let mut media = BTreeMap::<String, MediaCount>::new();
+    let mut encrypted_media = BTreeMap::<String, MediaCount>::new();
     let mut archives = Vec::new();
     for entry in &plan.entries {
         if entry.member.is_some() || matches!(entry.action, Action::Assemble { .. }) {
@@ -381,6 +388,20 @@ pub fn inspect(game: &Path) -> io::Result<InspectResult> {
                 format!("{} (contents not processed)", entry.path.0.display()),
                 entry.size,
             ));
+        }
+        let encrypted_kind = if rpgmaker.is_some() {
+            match ext.as_str() {
+                "rpgmvp" | "png_" => Some("encrypted image"),
+                "rpgmvo" | "rpgmvm" | "ogg_" | "m4a_" => Some("encrypted audio"),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(kind) = encrypted_kind {
+            let count = encrypted_media.entry(kind.into()).or_default();
+            count.count += 1;
+            count.bytes += entry.size;
         }
         compressor_media::summarize_file(&mut media, &path, entry.size)?;
     }
@@ -446,6 +467,7 @@ pub fn inspect(game: &Path) -> io::Result<InspectResult> {
         rpgmaker,
         unity,
         media,
+        encrypted_media,
         archives,
         packs: inspect_packs(game)?,
         tools,
@@ -903,6 +925,77 @@ pub fn unsupported_reason(result: &InspectResult) -> Option<String> {
 #[cfg(test)]
 mod unsupported_tests {
     use super::*;
+    #[test]
+    fn inspection_counts_encrypted_rpg_media_by_kind() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        for name in ["data", "js", "img", "audio"] {
+            std::fs::create_dir(dir.path().join(name))?;
+        }
+        std::fs::write(
+            dir.path().join("data/System.json"),
+            r#"{"hasEncryptedImages":true,"hasEncryptedAudio":true,"encryptionKey":"00000000000000000000000000000000"}"#,
+        )?;
+        std::fs::write(
+            dir.path().join("js/rpg_core.js"),
+            "Utils.RPGMAKER_VERSION = '1.6.1';",
+        )?;
+        std::fs::write(dir.path().join("img/a.rpgmvp"), b"encrypted image")?;
+        std::fs::write(dir.path().join("audio/b.rpgmvo"), b"encrypted audio")?;
+        let result = inspect(dir.path())?;
+        assert_eq!(result.encrypted_media["encrypted image"].count, 1);
+        assert_eq!(result.encrypted_media["encrypted audio"].count, 1);
+        assert!(serde_json::to_value(&result)?
+            .get("encrypted_media")
+            .is_none());
+        Ok(())
+    }
+    #[test]
+    fn preview_matches_real_plans_for_renpy_and_unity() -> io::Result<()> {
+        let renpy = compressor_test_fixtures::Fixture::new()?;
+        let unity = tempfile::tempdir()?;
+        std::fs::write(unity.path().join("Game.exe"), b"player")?;
+        let data = unity.path().join("Game_Data");
+        std::fs::create_dir(&data)?;
+        let mut header = vec![0; 8];
+        header.extend_from_slice(&22u32.to_be_bytes());
+        header.extend_from_slice(&[0; 36]);
+        header.extend_from_slice(b"2021.3.45f2\0");
+        header.extend_from_slice(&19i32.to_le_bytes());
+        std::fs::write(data.join("globalgamemanagers"), header)?;
+        std::fs::write(data.join("resources.assets"), b"assets")?;
+        for root in [renpy.root(), unity.path()] {
+            let engines = engine_registry(false);
+            let (adapter, engine) = engines.detect(root)?.unwrap();
+            let settings = compressor_core::settings::resolve(
+                None,
+                &[],
+                adapter.id(),
+                &engine_specs(&engines),
+            )?;
+            let actual = build_plan(
+                root,
+                adapter.as_ref(),
+                engine.clone(),
+                settings.clone(),
+                &registry(),
+            )?;
+            let preview = compressor_core::planning::preview_plan(
+                root,
+                adapter.as_ref(),
+                engine,
+                settings,
+                &registry(),
+            )?;
+            assert_eq!(actual.entries.len(), preview.entries.len());
+            for (a, b) in actual.entries.iter().zip(&preview.entries) {
+                assert_eq!(
+                    (&a.path, &a.member, a.size, &a.action),
+                    (&b.path, &b.member, b.size, &b.action)
+                );
+            }
+        }
+        Ok(())
+    }
     #[test]
     fn detects_unknown_renpy_and_unsupported_unity() -> io::Result<()> {
         let fixture = compressor_test_fixtures::Fixture::new()?;

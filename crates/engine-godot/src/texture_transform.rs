@@ -37,8 +37,8 @@ impl Transformer for GodotTextureTransformer {
             if texture.images.len() != 1 || texture.mipmaps != 0 {
                 return Err(io::Error::other("unsupported texture type"));
             }
-            let input = tempfile::NamedTempFile::new()?;
-            let output = tempfile::NamedTempFile::new()?;
+            let input = tempfile::NamedTempFile::new_in(dst.parent().unwrap_or(Path::new(".")))?;
+            let output = tempfile::NamedTempFile::new_in(dst.parent().unwrap_or(Path::new(".")))?;
             std::fs::write(input.path(), &texture.images[0])?;
             let transformer = compressor_media::webp::WebpTransformer;
             let note = transformer
@@ -87,8 +87,8 @@ impl Transformer for GodotTextureTransformer {
             {
                 return Err(io::Error::other("texture header changed"));
             }
-            let input = tempfile::NamedTempFile::new()?;
-            let output = tempfile::NamedTempFile::new()?;
+            let input = tempfile::NamedTempFile::new_in(dst.parent().unwrap_or(Path::new(".")))?;
+            let output = tempfile::NamedTempFile::new_in(dst.parent().unwrap_or(Path::new(".")))?;
             std::fs::write(input.path(), &before.images[0])?;
             std::fs::write(output.path(), &after.images[0])?;
             compressor_media::webp::WebpTransformer

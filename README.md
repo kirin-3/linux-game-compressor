@@ -17,15 +17,29 @@ The binary is `target/release/compressor`.
 ## Desktop app
 
 Launch the desktop app with `cargo run --release -p compressor-gui`, or run
-`target/release/compressor-gui` after building the workspace. Drag game folders
-onto the window, or use **Add folder**. Choose an output folder to put all games
-there; otherwise each output is created beside its input. Select a game to
-change its profile, settings, verification, or output folder, then press **Start**.
-The queue processes games one at a time and verifies finished outputs by default.
+`target/release/compressor-gui` after building the workspace. Drop game folders
+onto the window or choose **Add games**. The toolbar's **Output** control
+chooses a common output folder; **Reset** returns to placing each output beside
+its input. Choose the default profile and whether finished games are verified,
+then press **Start compression**. **Stop queue** stops after the current game.
+
+The queue lists each game's engine, input size, estimated or actual result, and
+status. Select a row for its details. Its menu can move or remove a game, open
+its output, or cancel a running game. Totals combine actual results and estimates.
+Estimates are marked with `~` and include a range; they are calculated in the
+background from encoded samples and replaced by actual sizes after compression.
+
+In the details, choose **Best looking** (`quality`), **Recommended** (`balanced`),
+or **Smallest** (`small`). Adjust image, audio, video, and engine settings for
+that game; less common controls are under **More options**. Changed controls
+can be reset individually, and **Back to…** restores the chosen profile.
+The panel also lets you change the game's output folder, choose verification,
+open or verify a completed output, and expand **Problems** for failed, skipped,
+or verification entries. A missing-tools banner appears when tools are needed.
 
 On Linux the app uses X11 when `DISPLAY` is available, including XWayland on
 Wayland desktops, to support folder drops. Without `DISPLAY`, it uses Wayland
-and **Add folder** remains available. Set `COMPRESSOR_GUI_BACKEND=wayland` to
+and **Add games** remains available. Set `COMPRESSOR_GUI_BACKEND=wayland` to
 choose native Wayland; drag and drop is unavailable there.
 
 Preferences are saved in `~/.config/compressor/gui.toml` (or under
