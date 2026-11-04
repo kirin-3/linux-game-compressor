@@ -38,8 +38,8 @@ game is never modified.
 - **Resumable.** An interrupted job continues where it stopped.
 - **Engine-aware.** Rebuilds Godot `.pck` packs, re-encrypts RPG Maker
   assets with the game's key, and repacks Unity player data losslessly.
-- **Desktop app and CLI.** The same engine powers both, with identical
-  settings.
+- **One file.** The desktop app and the command-line tool are a single
+  executable with identical settings. Nothing to unpack.
 
 ## Supported games
 
@@ -80,23 +80,28 @@ The app shows a banner if any tool is missing.
 ### 2. Get Linux Game Compressor
 
 Linux Game Compressor is a single file: the desktop app and the command-line
-tool in one. Download `linux-game-compressor` from
+tool in one. It runs on x86-64 Linux with glibc 2.35 or newer (Ubuntu 22.04,
+Debian 12, Fedora 36 and later, and any current Arch-based distribution).
+
+Download it from
 [Releases](https://github.com/kirin-3/linux-game-compressor/releases/latest),
-then make it executable and run it:
+or from a terminal:
 
 ```sh
+curl -LO https://github.com/kirin-3/linux-game-compressor/releases/latest/download/linux-game-compressor
 chmod +x linux-game-compressor
 ./linux-game-compressor
 ```
 
-To add it to your app menu and your `PATH`, run:
+To add it to your app menu and your `PATH`, run once:
 
 ```sh
 ./linux-game-compressor install
 ```
 
-This copies it to `~/.local/bin` and adds a menu entry and icon.
-`linux-game-compressor uninstall` removes them again.
+This copies it to `~/.local/bin` and adds a menu entry and icon. To update,
+download the new version and run `install` again.
+`linux-game-compressor uninstall` removes it again.
 
 ### Build from source
 
@@ -130,8 +135,9 @@ or **Smallest** (`small`). Adjust image, audio, video, and engine settings for
 that game; less common controls are under **More options**. Changed controls
 can be reset individually, and **Back to…** restores the chosen profile.
 The panel also lets you change the game's output folder, choose verification,
-open or verify a completed output, and expand **Problems** for failed, skipped,
-or verification entries. A missing-tools banner appears when tools are needed.
+open or verify a completed output, and expand **Problems** for files that
+failed to convert or verify, or **Kept unchanged** for files left as they were
+and why. A missing-tools banner appears when tools are needed.
 
 On Linux the app uses X11 when `DISPLAY` is available, including XWayland on
 Wayland desktops, to support folder drops. Without `DISPLAY`, it uses Wayland
@@ -262,11 +268,12 @@ cargo test --workspace
 ```
 
 To publish a release, push a tag such as `v0.1.0`. The
-[release workflow](.github/workflows/release.yml) builds the Linux package and
-attaches it to a GitHub release.
+[release workflow](.github/workflows/release.yml) builds the binary and
+attaches it, with its SHA-256 checksum, to a GitHub release.
 
 ## License
 
 Linux Game Compressor is licensed under the
 [GNU General Public License v3.0](LICENSE). Licenses of bundled third-party
-crates are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
+crates are listed in [THIRD_PARTY.md](THIRD_PARTY.md), and
+`linux-game-compressor licenses` prints both.
