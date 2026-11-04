@@ -120,6 +120,7 @@ struct App {
     tool_warnings: Vec<String>,
     selected: Option<std::path::PathBuf>,
     output_generation: u64,
+    logo: egui::TextureHandle,
 }
 
 impl App {
@@ -577,6 +578,19 @@ impl eframe::App for App {
     }
 }
 
+pub(crate) const APP_NAME: &str = "Linux Game Compressor";
+const APP_ID: &str = "linux-game-compressor";
+
+/// The 256 px app logo, used as the window icon and in the toolbar.
+fn logo_image() -> image::RgbaImage {
+    image::load_from_memory_with_format(
+        include_bytes!("../assets/icon-256.png"),
+        image::ImageFormat::Png,
+    )
+    .expect("embedded logo is a valid PNG")
+    .into_rgba8()
+}
+
 pub(crate) fn run() -> eframe::Result {
     let wayland = std::env::var("COMPRESSOR_GUI_BACKEND").is_ok_and(|v| v == "wayland")
         || std::env::var_os("DISPLAY").is_none_or(|v| v.is_empty());
@@ -585,8 +599,17 @@ pub(crate) fn run() -> eframe::Result {
         .as_deref()
         .map(Preferences::load)
         .unwrap_or_default();
+    let icon = logo_image();
     let mut options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size(prefs.window_size),
+        viewport: egui::ViewportBuilder::default()
+            .with_title(APP_NAME)
+            .with_app_id(APP_ID)
+            .with_icon(std::sync::Arc::new(egui::IconData {
+                rgba: icon.as_raw().clone(),
+                width: icon.width(),
+                height: icon.height(),
+            }))
+            .with_inner_size(prefs.window_size),
         ..Default::default()
     };
     #[cfg(target_os = "linux")]
@@ -602,10 +625,18 @@ pub(crate) fn run() -> eframe::Result {
     }
     let runtime = tokio::runtime::Runtime::new().expect("create background runtime");
     eframe::run_native(
-        "Compressor",
+        APP_NAME,
         options,
         Box::new(move |cc| {
             style::apply(&cc.egui_ctx);
+            let logo = cc.egui_ctx.load_texture(
+                "logo",
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [icon.width() as usize, icon.height() as usize],
+                    icon.as_raw(),
+                ),
+                egui::TextureOptions::LINEAR,
+            );
             let worker = start_worker(&runtime, cc.egui_ctx.clone());
             let queue_worker = queue::start(&runtime, cc.egui_ctx.clone());
             let estimator = estimate::Worker::new(&runtime, cc.egui_ctx.clone());
@@ -627,6 +658,7 @@ pub(crate) fn run() -> eframe::Result {
                 tool_warnings: Vec::new(),
                 selected: None,
                 output_generation: 0,
+                logo,
             }))
         }),
     )
@@ -635,6 +667,12 @@ pub(crate) fn run() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn embedded_logo_decodes() {
+        let logo = logo_image();
+        assert_eq!((logo.width(), logo.height()), (256, 256));
+        assert_eq!(logo.get_pixel(0, 0)[3], 0, "corners are transparent");
+    }
     #[test]
     fn preferences_round_trip_and_corruption() {
         let dir = tempfile::tempdir().unwrap();

@@ -1,4 +1,6 @@
-# Game media compressor
+<p align="center"><img src="crates/gui/assets/logo.png" width="128" alt=""></p>
+
+# Linux Game Compressor
 
 A Linux desktop and command-line tool for copying a Ren'Py, Godot 4, Unity, or RPG Maker MV/MZ game to a separate
 directory while converting eligible images, audio, and video to smaller, validated

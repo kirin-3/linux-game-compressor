@@ -10,6 +10,7 @@ compressor-app.workspace = true
 compressor-core.workspace = true
 eframe.workspace = true
 egui_extras.workspace = true
+image.workspace = true
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
 rfd.workspace = true
 directories.workspace = true

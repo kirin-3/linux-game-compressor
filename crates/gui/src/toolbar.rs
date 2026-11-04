@@ -6,7 +6,8 @@ pub(super) fn show(app: &mut App, ctx: &egui::Context) {
             .inner_margin(egui::Margin::symmetric(16, 12))
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.heading("Compressor");
+                    ui.add(egui::Image::new((app.logo.id(), egui::vec2(28.0, 28.0))));
+                    ui.heading(super::APP_NAME);
                     ui.add_space(12.0);
                     if ui.button("+  Add games").clicked() {
                         let _ = app.worker.commands.send(Command::Pick);
