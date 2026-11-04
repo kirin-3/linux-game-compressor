@@ -375,7 +375,7 @@ pub async fn run_job_with_archives(
                             }
                             ("removed".to_owned(), false, false)
                         },
-                        (Action::Copy { reason } | Action::Skip { reason }, _) => match copy::stage_copy_entry(&root, &output, &path.0, &temporary)? {
+                        (Action::Copy { reason } | Action::Skip { reason }, _) => match copy::stage_copy_entry_cancellable(&root, &output, &path.0, &temporary, &token)? {
                             CopyOutcome::Copied => { if token.is_cancelled() { return Err(io::Error::new(io::ErrorKind::Interrupted,"cancelled")); } tokio::fs::rename(&temporary, &destination).await?; (reason.clone(), false, true) },
                             CopyOutcome::Skipped(reason) => (reason, false, false),
                         },
