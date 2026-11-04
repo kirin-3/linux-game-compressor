@@ -231,13 +231,17 @@ async fn estimate_plan(
                 (cores / 2).max(1),
             ));
         }
+        // Samples stop on this token when the estimate is cancelled or fails,
+        // and are drained before returning so none writes to `temp` after it
+        // is removed.
+        let samples_cancel = cancel.child_token();
         for (slot, index) in indices.into_iter().enumerate() {
             let slot = done + slot;
             let plan = plan_for_samples.clone();
             let regs = regs_for_samples.clone();
             let options = sample_options.clone();
             let entry = entries[index].clone();
-            let cancel = cancel.clone();
+            let cancel = samples_cancel.clone();
             let dir = temp.path().to_owned();
             tasks.spawn(async move {
                 let input_size = entry.size;
@@ -246,12 +250,24 @@ async fn estimate_plan(
             });
         }
         let mut results = Vec::new();
+        let mut failure = None;
         while let Some(joined) = tasks.join_next().await {
-            let result = joined.map_err(io::Error::other)??;
-            results.push(result);
-            done += 1;
-            progress(done, total_samples);
-            cancelled(cancel)?;
+            let outcome = joined
+                .map_err(io::Error::other)
+                .and_then(|result| result)
+                .and_then(|result| {
+                    results.push(result);
+                    done += 1;
+                    progress(done, total_samples);
+                    cancelled(cancel)
+                });
+            if let Err(error) = outcome {
+                samples_cancel.cancel();
+                failure.get_or_insert(error);
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         results.sort_by_key(|(slot, _, _)| *slot);
         for (_, input, sample) in results {
