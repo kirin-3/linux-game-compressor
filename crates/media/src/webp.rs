@@ -474,7 +474,7 @@ mod tests {
         assert!(std::fs::metadata(&converted)?.len() >= std::fs::metadata(&source)?.len());
         let (size, hash) = compressor_core::planning::hash_input(&source)?;
         let plan = Plan {
-            plan_version: 5,
+            plan_version: 6,
             input_root: StoredPath(source_dir.canonicalize()?),
             engine: EngineInfo {
                 name: "fake".into(),

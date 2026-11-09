@@ -161,6 +161,17 @@ fn inspection(ui: &mut egui::Ui, row: &Row) {
                 ui.label(note);
             }
         }
+        for container in &info.result.unreal {
+            ui.label(format!(
+                "{} · {} · {}",
+                container.name,
+                size(container.ucas_bytes.into()),
+                match &container.reason {
+                    Some(reason) => format!("copied unchanged: {reason}"),
+                    None => "will be compressed".to_owned(),
+                }
+            ));
+        }
         for unity in &info.result.unity {
             ui.label(format!(
                 "{} · {} · {} · {}",

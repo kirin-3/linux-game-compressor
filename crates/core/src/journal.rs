@@ -189,7 +189,7 @@ mod tests {
             failure: false,
         };
         let plan = Plan {
-            plan_version: 5,
+            plan_version: 6,
             input_root: StoredPath(temp.path().to_owned()),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -250,7 +250,7 @@ mod tests {
             })
             .collect();
         let plan = Plan {
-            plan_version: 5,
+            plan_version: 6,
             input_root: StoredPath(output.to_owned()),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -318,6 +318,16 @@ pub struct ArchiveSummary {
     pub outcome: String,
 }
 
+/// The combined sizes of a rewritten pair, reported under the primary file's path.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RewriteSummary {
+    pub path: StoredPath,
+    pub partner: StoredPath,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub outcome: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Report {
     pub complete: bool,
@@ -329,6 +339,8 @@ pub struct Report {
     pub savings_by_media: BTreeMap<String, i128>,
     pub removals: Vec<Removal>,
     pub archives: Vec<ArchiveSummary>,
+    #[serde(default)]
+    pub rewrites: Vec<RewriteSummary>,
     pub skips: Vec<JournalEntry>,
     pub failures: Vec<JournalEntry>,
 }
@@ -377,6 +389,7 @@ pub fn build_report(manifest: &Manifest) -> Report {
     let mut skips = Vec::new();
     let mut failures = Vec::new();
     let mut archives = Vec::new();
+    let mut rewrites = Vec::new();
     for record in &manifest.entries {
         let mut display_record = record.clone();
         display_record.path = display_path(&record.path, record.member.as_deref());
@@ -386,6 +399,7 @@ pub fn build_report(manifest: &Manifest) -> Report {
             && record.outcome != "rebuilt"
             && record.outcome != "removed"
             && record.outcome != "archived"
+            && record.outcome != "rewritten"
         {
             skips.push(display_record);
         }
@@ -406,6 +420,26 @@ pub fn build_report(manifest: &Manifest) -> Report {
                 if record.outcome == "archived" {
                     *savings_by_media.entry("data".to_owned()).or_insert(0) +=
                         i128::from(entry.size) - i128::from(record.output_size);
+                }
+            }
+            if let crate::Action::Rewrite { partner, .. } = &entry.action {
+                if let Some(other) = manifest
+                    .entries
+                    .iter()
+                    .find(|r| r.member.is_none() && r.path == *partner)
+                {
+                    rewrites.push(RewriteSummary {
+                        path: entry.path.clone(),
+                        partner: partner.clone(),
+                        input_bytes: record.input_size + other.input_size,
+                        output_bytes: record.output_size + other.output_size,
+                        outcome: record.outcome.clone(),
+                    });
+                    if record.outcome == "rewritten" {
+                        *savings_by_media.entry("data".to_owned()).or_insert(0) +=
+                            i128::from(record.input_size + other.input_size)
+                                - i128::from(record.output_size + other.output_size);
+                    }
                 }
             }
             if let crate::Action::Remove { reason } = &entry.action {
@@ -456,6 +490,7 @@ pub fn build_report(manifest: &Manifest) -> Report {
         savings_by_media,
         removals,
         archives,
+        rewrites,
         skips,
         failures,
     }

@@ -286,6 +286,16 @@ pub enum Action {
     Rebuild {
         format: String,
     },
+    /// The primary file of a pair that is rewritten together with `partner`.
+    Rewrite {
+        format: String,
+        params: serde_json::Value,
+        partner: StoredPath,
+    },
+    /// The second file of a rewritten pair; its work is done by the primary's entry.
+    RewritePartner {
+        primary: StoredPath,
+    },
     Convert {
         kind: MediaKind,
         target: String,
@@ -437,7 +447,7 @@ mod tests {
             PathBuf::from(OsString::from_vec(b"game/invalid-\xff.png".to_vec())),
         ];
         let plan = Plan {
-            plan_version: 5,
+            plan_version: 6,
             input_root: StoredPath("/tmp/game".into()),
             engine: EngineInfo {
                 name: "Ren'Py".into(),
@@ -500,6 +510,26 @@ mod tests {
                     hash: "jkl".into(),
                     action: Action::Archive {
                         archive: StoredPath("data/data.unity3d".into()),
+                    },
+                },
+                Entry {
+                    path: StoredPath("Paks/g.ucas".into()),
+                    member: None,
+                    size: 9,
+                    hash: "pqr".into(),
+                    action: Action::Rewrite {
+                        format: "test-pair".into(),
+                        params: serde_json::json!({"level": 9}),
+                        partner: StoredPath("Paks/g.utoc".into()),
+                    },
+                },
+                Entry {
+                    path: StoredPath("Paks/g.utoc".into()),
+                    member: None,
+                    size: 2,
+                    hash: "stu".into(),
+                    action: Action::RewritePartner {
+                        primary: StoredPath("Paks/g.ucas".into()),
                     },
                 },
                 Entry {

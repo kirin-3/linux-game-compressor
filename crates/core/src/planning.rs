@@ -12,7 +12,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
-const PLAN_VERSION: u64 = 5;
+const PLAN_VERSION: u64 = 6;
 
 fn versioned_json(path: &Path, manifest: bool) -> io::Result<serde_json::Value> {
     let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
@@ -361,6 +361,35 @@ fn plan_inner(
     if entries.iter().any(|entry| matches!(&entry.action, Action::Archive { archive } if !entries.iter().any(|candidate| candidate.path == *archive && matches!(candidate.action, Action::Assemble { .. })))) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "archive classification has no archive plan"));
     }
+    for pair in adapter.rewrites(&root, &engine, &settings)? {
+        let missing = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rewrite pair file missing from input",
+            )
+        };
+        let find = |entries: &[Entry], path: &Path| {
+            entries
+                .iter()
+                .position(|e| e.member.is_none() && e.path.0 == path)
+        };
+        let primary = find(&entries, &pair.path).ok_or_else(missing)?;
+        let partner = find(&entries, &pair.partner).ok_or_else(missing)?;
+        if primary == partner {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rewrite pair names one file twice",
+            ));
+        }
+        entries[primary].action = Action::Rewrite {
+            format: pair.format,
+            params: pair.params,
+            partner: StoredPath(pair.partner),
+        };
+        entries[partner].action = Action::RewritePartner {
+            primary: StoredPath(pair.path),
+        };
+    }
     entries.sort_by(|a, b| a.path.0.cmp(&b.path.0).then(a.member.cmp(&b.member)));
     let notes = adapter.plan_notes(&root, &engine, &settings, &entries);
     engine.notes.extend(notes);
@@ -390,13 +419,41 @@ fn plan_inner(
         }
     }
     Ok(Plan {
-        plan_version: 5,
+        plan_version: 6,
         input_root: StoredPath(root),
         engine,
         settings,
         tools,
         entries,
     })
+}
+
+/// A rewrite entry must be a loose file with a recorded size and hash, and it and its
+/// partner must name each other exactly once.
+fn check_pair(plan: &Plan, entry: &Entry, other: &StoredPath, primary: bool) -> io::Result<()> {
+    let bad = |message: &'static str| io::Error::new(io::ErrorKind::InvalidData, message);
+    if entry.member.is_some() || entry.hash.is_empty() || other == &entry.path {
+        return Err(bad("rewrite pair entry is not a recorded file"));
+    }
+    let mut partners = plan
+        .entries
+        .iter()
+        .filter(|candidate| candidate.path == *other && candidate.member.is_none());
+    let (Some(partner), None) = (partners.next(), partners.next()) else {
+        return Err(bad("rewrite pair has no unique partner entry"));
+    };
+    if partner.hash.is_empty() {
+        return Err(bad("rewrite pair entry is not a recorded file"));
+    }
+    let named_back = match &partner.action {
+        Action::RewritePartner { primary: back } if primary => back == &entry.path,
+        Action::Rewrite { partner: back, .. } if !primary => back == &entry.path,
+        _ => false,
+    };
+    if !named_back {
+        return Err(bad("rewrite pair entries do not name each other"));
+    }
+    Ok(())
 }
 
 /// Reject plans if their input tree or any recorded content has changed.
@@ -485,6 +542,12 @@ fn validate_plan_inner(
                         "archive members disagree with plan",
                     ));
                 }
+            }
+            Action::Rewrite { partner, .. } => {
+                check_pair(plan, entry, partner, true)?;
+            }
+            Action::RewritePartner { primary } => {
+                check_pair(plan, entry, primary, false)?;
             }
             Action::Archive { archive }
                 if entry.member.is_some()
@@ -878,6 +941,118 @@ mod tests {
             .entries
             .iter()
             .any(|e| e.path.0 == Path::new("outside.txt")));
+        Ok(())
+    }
+
+    struct PairAdapter {
+        primary: &'static str,
+        partner: &'static str,
+    }
+    impl EngineAdapter for PairAdapter {
+        fn id(&self) -> &'static str {
+            "pair"
+        }
+        fn detect(&self, _: &Path) -> io::Result<Option<EngineInfo>> {
+            unreachable!()
+        }
+        fn classify(
+            &self,
+            _: &Path,
+            _: &Path,
+            _: &EngineInfo,
+            _: &ResolvedSettings,
+        ) -> io::Result<Action> {
+            Ok(Action::Copy {
+                reason: "test".into(),
+            })
+        }
+        fn rewrites(
+            &self,
+            _: &Path,
+            _: &EngineInfo,
+            _: &ResolvedSettings,
+        ) -> io::Result<Vec<crate::registry::RewritePlan>> {
+            Ok(vec![crate::registry::RewritePlan {
+                path: self.primary.into(),
+                partner: self.partner.into(),
+                format: "fake".into(),
+                params: serde_json::json!({}),
+            }])
+        }
+    }
+    fn pair_plan(
+        primary: &'static str,
+        partner: &'static str,
+    ) -> (tempfile::TempDir, io::Result<Plan>) {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a.ucas"), b"data").unwrap();
+        fs::write(temp.path().join("a.utoc"), b"toc").unwrap();
+        let engine = EngineInfo {
+            name: "fake".into(),
+            version: None,
+            excluded_paths: vec![],
+            notes: vec![],
+            version_check_overridden: false,
+        };
+        let plan = build_plan(
+            temp.path(),
+            &PairAdapter { primary, partner },
+            engine,
+            ResolvedSettings::default(),
+            &TransformerRegistry::default(),
+        );
+        (temp, plan)
+    }
+    #[test]
+    fn plans_and_validates_rewrite_pairs() -> io::Result<()> {
+        let (temp, plan) = pair_plan("a.ucas", "a.utoc");
+        let mut plan = plan?;
+        assert_eq!(plan.plan_version, 6);
+        let primary = &plan.entries[0];
+        assert!(
+            matches!(&primary.action, Action::Rewrite { partner, .. } if partner.0 == Path::new("a.utoc"))
+        );
+        assert!(
+            matches!(&plan.entries[1].action, Action::RewritePartner { primary } if primary.0 == Path::new("a.ucas"))
+        );
+        assert_eq!((plan.entries[0].size, plan.entries[1].size), (4, 3));
+        validate_plan(&plan, temp.path())?;
+        // A partner that does not name its primary is rejected.
+        let good = plan.clone();
+        plan.entries[1].action = Action::RewritePartner {
+            primary: StoredPath("other".into()),
+        };
+        assert!(validate_plan(&plan, temp.path()).is_err());
+        // A pair entry without a recorded hash is rejected.
+        let mut plan = good.clone();
+        plan.entries[1].hash.clear();
+        assert!(validate_plan(&plan, temp.path()).is_err());
+        // A primary whose partner entry is gone is rejected.
+        let mut plan = good;
+        plan.entries.remove(1);
+        assert!(validate_plan(&plan, temp.path()).is_err());
+        Ok(())
+    }
+    #[test]
+    fn planning_rejects_missing_or_repeated_pair_files() {
+        assert!(pair_plan("a.ucas", "missing.utoc").1.is_err());
+        assert!(pair_plan("a.ucas", "a.ucas").1.is_err());
+    }
+    #[test]
+    fn version_five_plans_ask_for_a_new_plan() -> io::Result<()> {
+        let (temp, plan) = pair_plan("a.ucas", "a.utoc");
+        let mut plan = plan?;
+        plan.plan_version = 5;
+        assert!(validate_plan(&plan, temp.path())
+            .unwrap_err()
+            .to_string()
+            .contains("re-run plan"));
+        let path = temp.path().join("plan.json");
+        fs::write(&path, serde_json::to_vec(&plan)?)?;
+        assert!(read_plan(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("re-run plan"));
         Ok(())
     }
 }

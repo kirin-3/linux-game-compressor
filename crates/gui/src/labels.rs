@@ -91,6 +91,11 @@ pub(super) fn setting(key: &str) -> Label {
             "Compress supported Unity player data into an archive.",
             "",
         ),
+        "engines.unreal.compress_containers" => (
+            "Compress game containers",
+            "Compress raw Unreal Engine game containers without loss.",
+            "",
+        ),
         _ => {
             return Label {
                 name: key.rsplit('.').next().unwrap_or(key).replace('_', " "),

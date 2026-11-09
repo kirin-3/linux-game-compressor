@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=Linux Game Compressor
-Comment=Shrink Ren'Py, Godot, Unity and RPG Maker games
+Comment=Shrink Ren'Py, Godot, Unity, Unreal Engine and RPG Maker games
 Exec=linux-game-compressor
 Icon=linux-game-compressor
 Terminal=false

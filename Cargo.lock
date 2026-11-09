@@ -454,6 +454,7 @@ dependencies = [
  "compressor-engine-renpy",
  "compressor-engine-rpgm",
  "compressor-engine-unity",
+ "compressor-engine-unreal",
  "compressor-media",
  "compressor-test-fixtures",
  "serde",
@@ -556,6 +557,20 @@ dependencies = [
  "compressor-core",
  "lz4",
  "lzma-rs",
+ "rayon",
+ "serde_json",
+ "tempfile",
+ "tokio-util",
+]
+
+[[package]]
+name = "compressor-engine-unreal"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "compressor-core",
+ "compressor-test-fixtures",
+ "flate2",
  "rayon",
  "serde_json",
  "tempfile",

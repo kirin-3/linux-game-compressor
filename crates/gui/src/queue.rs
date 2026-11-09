@@ -252,13 +252,14 @@ async fn run(
         ctx.clone(),
     ));
     let jobs = std::thread::available_parallelism().map_or(1, usize::from);
-    let result = compressor_core::job::run_job_with_archives(
+    let result = compressor_core::job::run_job_with_rewrites(
         &plan,
         &output,
         &registry.transformers,
         &registry.packs,
         &registry.envelopes,
         &registry.archives,
+        &registry.rewrites,
         jobs,
         cancel.clone(),
         force,

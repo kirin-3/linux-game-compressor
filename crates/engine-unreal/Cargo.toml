@@ -1,0 +1,19 @@
+[package]
+name = "compressor-engine-unreal"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+compressor-core.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+rayon.workspace = true
+tokio-util.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+compressor-test-fixtures = { path = "../test-fixtures" }
+tempfile.workspace = true

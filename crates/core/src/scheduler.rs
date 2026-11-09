@@ -402,7 +402,7 @@ mod tests {
             });
         }
         Ok(Plan {
-            plan_version: 5,
+            plan_version: 6,
             input_root: StoredPath(input),
             engine: EngineInfo {
                 name: "fake".into(),

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/gui", "crates/app", "crates/core", "crates/media", "crates/engine-renpy", "crates/engine-godot", "crates/engine-rpgm", "crates/engine-unity", "crates/cli", "crates/test-fixtures"]
+members = ["crates/gui", "crates/app", "crates/core", "crates/media", "crates/engine-renpy", "crates/engine-godot", "crates/engine-rpgm", "crates/engine-unity", "crates/engine-unreal", "crates/cli", "crates/test-fixtures"]
 
 [workspace.package]
 edition = "2021"
@@ -20,6 +20,8 @@ compressor-engine-renpy = { path = "crates/engine-renpy" }
 compressor-engine-godot = { path = "crates/engine-godot" }
 compressor-engine-rpgm = { path = "crates/engine-rpgm" }
 compressor-engine-unity = { path = "crates/engine-unity" }
+compressor-engine-unreal = { path = "crates/engine-unreal" }
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

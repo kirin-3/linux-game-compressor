@@ -30,6 +30,15 @@ pub struct ArchivePlan {
     pub members: Vec<PathBuf>,
 }
 
+/// A pair of files that one adapter rewrites together, named by relative path.
+#[derive(Clone, Debug)]
+pub struct RewritePlan {
+    pub path: PathBuf,
+    pub partner: PathBuf,
+    pub format: String,
+    pub params: serde_json::Value,
+}
+
 /// Engine-specific detection and decisions; paths passed to `classify` are relative.
 pub trait EngineAdapter: Send + Sync {
     fn id(&self) -> &'static str;
@@ -43,6 +52,15 @@ pub trait EngineAdapter: Send + Sync {
         _engine: &EngineInfo,
         _settings: &ResolvedSettings,
     ) -> io::Result<Vec<ArchivePlan>> {
+        Ok(Vec::new())
+    }
+    /// Pairs of files to rewrite together; both paths must exist in the input.
+    fn rewrites(
+        &self,
+        _root: &Path,
+        _engine: &EngineInfo,
+        _settings: &ResolvedSettings,
+    ) -> io::Result<Vec<RewritePlan>> {
         Ok(Vec::new())
     }
     fn classify(
@@ -160,6 +178,56 @@ impl ArchiveRegistry {
         self.0.insert(format.to_owned(), handler);
     }
     pub fn get(&self, format: &str) -> Option<Arc<dyn ArchiveFormat>> {
+        self.0.get(format).cloned()
+    }
+}
+
+/// One input file of a rewritten pair, with the size and hash recorded in the plan.
+#[derive(Clone, Debug)]
+pub struct RewriteInput {
+    pub path: PathBuf,
+    pub size: u64,
+    pub hash: String,
+}
+
+/// Rewrites two files together and can recover the originals' size and hash from the result.
+pub trait RewriteFormat: Send + Sync {
+    /// Estimate output bytes divided by input bytes of both files when supported.
+    fn estimate_ratio(
+        &self,
+        _primary: &RewriteInput,
+        _partner: &RewriteInput,
+        _sample_blocks: usize,
+        _cancel: &CancellationToken,
+    ) -> io::Result<Option<f64>> {
+        Ok(None)
+    }
+    fn write(
+        &self,
+        primary: &RewriteInput,
+        partner: &RewriteInput,
+        primary_output: &Path,
+        partner_output: &Path,
+        params: &serde_json::Value,
+        cancel: &CancellationToken,
+    ) -> io::Result<()>;
+    /// Return (size, blake3 hex) of the original primary and partner bytes.
+    #[allow(clippy::type_complexity)]
+    fn restore_hashes(
+        &self,
+        primary_output: &Path,
+        partner_output: &Path,
+        cancel: &CancellationToken,
+    ) -> io::Result<((u64, String), (u64, String))>;
+}
+
+#[derive(Clone, Default)]
+pub struct RewriteRegistry(HashMap<String, Arc<dyn RewriteFormat>>);
+impl RewriteRegistry {
+    pub fn register(&mut self, format: &str, handler: Arc<dyn RewriteFormat>) {
+        self.0.insert(format.to_owned(), handler);
+    }
+    pub fn get(&self, format: &str) -> Option<Arc<dyn RewriteFormat>> {
         self.0.get(format).cloned()
     }
 }
@@ -324,6 +392,32 @@ mod tests {
             .read_directory(Path::new("."))
             .unwrap()
             .is_empty());
+        let mut rewrites = RewriteRegistry::default();
+        assert!(rewrites.get("fake").is_none());
+        struct Pair;
+        impl RewriteFormat for Pair {
+            fn write(
+                &self,
+                _: &RewriteInput,
+                _: &RewriteInput,
+                _: &Path,
+                _: &Path,
+                _: &serde_json::Value,
+                _: &CancellationToken,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            fn restore_hashes(
+                &self,
+                _: &Path,
+                _: &Path,
+                _: &CancellationToken,
+            ) -> io::Result<((u64, String), (u64, String))> {
+                Ok(((1, "a".into()), (2, "b".into())))
+            }
+        }
+        rewrites.register("fake", Arc::new(Pair));
+        assert!(rewrites.get("fake").is_some());
         let mut engines = EngineRegistry::default();
         engines.register(Arc::new(Adapter));
         let (adapter, info) = engines.detect(Path::new(".")).unwrap().unwrap();

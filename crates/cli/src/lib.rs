@@ -4,7 +4,7 @@ use compressor_app::{
     pack_registry, plan_counts, registry, verify,
 };
 use compressor_core::{
-    job::{run_job_with_archives, Event},
+    job::{run_job_with_rewrites, Event},
     planning::validate_plan,
     Action,
 };
@@ -21,7 +21,7 @@ mod install;
 #[command(
     name = "linux-game-compressor",
     version,
-    about = "Make Ren'Py, Godot, Unity and RPG Maker games smaller.",
+    about = "Make Ren'Py, Godot, Unity, Unreal Engine and RPG Maker games smaller.",
     after_help = "Run without arguments to open the desktop app."
 )]
 struct Cli {
@@ -235,6 +235,38 @@ async fn run(cli: Cli) -> io::Result<i32> {
                     );
                     println!("  to archive: {} files, {} bytes; streamed resources: {} files, {} bytes; bundles: {} files, {} bytes", unity.archive_files.count, unity.archive_files.bytes, unity.streamed_resources.count, unity.streamed_resources.bytes, unity.bundles.count, unity.bundles.bytes);
                 }
+                for container in &result.unreal {
+                    println!(
+                        "Unreal container: {} (table of contents v{}; {}; {}; {}; {} bytes; {})",
+                        container.path.0.with_extension("").display(),
+                        container
+                            .toc_version
+                            .map_or_else(|| "?".to_owned(), |v| v.to_string()),
+                        if container.compressed {
+                            format!(
+                                "compressed with {}",
+                                container.compression_methods.join(", ")
+                            )
+                        } else {
+                            "uncompressed".to_owned()
+                        },
+                        if container.encrypted {
+                            "encrypted"
+                        } else {
+                            "not encrypted"
+                        },
+                        if container.signed {
+                            "signed"
+                        } else {
+                            "not signed"
+                        },
+                        container.ucas_bytes,
+                        match (&container.reason, container.will_compress) {
+                            (Some(reason), _) => format!("copied: {reason}"),
+                            (None, _) => "will be compressed".to_owned(),
+                        }
+                    );
+                }
                 for (name, count) in result.media {
                     println!("{name}: {} files, {} bytes", count.count, count.bytes);
                 }
@@ -329,6 +361,26 @@ async fn run(cli: Cli) -> io::Result<i32> {
                     archives.iter().map(|(count, _)| count).sum::<usize>(),
                     archives.iter().map(|(_, size)| size).sum::<u64>()
                 );
+                let pairs: Vec<_> = plan
+                    .entries
+                    .iter()
+                    .filter_map(|e| match &e.action {
+                        Action::Rewrite { partner, .. } => Some((e.size, partner)),
+                        _ => None,
+                    })
+                    .map(|(size, partner)| {
+                        size + plan
+                            .entries
+                            .iter()
+                            .find(|p| p.member.is_none() && p.path == *partner)
+                            .map_or(0, |p| p.size)
+                    })
+                    .collect();
+                println!(
+                    "pairs rewritten: {} ({} bytes)",
+                    pairs.len(),
+                    pairs.iter().sum::<u64>()
+                );
                 let mut by_media = BTreeMap::<String, usize>::new();
                 for entry in &plan.entries {
                     let media = match &entry.action {
@@ -373,6 +425,10 @@ async fn run(cli: Cli) -> io::Result<i32> {
                         Action::Assemble {
                             format, members, ..
                         } => format!("assemble: {format} ({} files)", members.len()),
+                        Action::Rewrite { format, .. } => format!("rewrite: {format}"),
+                        Action::RewritePartner { primary } => {
+                            format!("rewrite partner: {}", primary.0.display())
+                        }
                     };
                     *by_media.entry(format!("{media} {action}")).or_default() += 1;
                 }
@@ -388,6 +444,10 @@ async fn run(cli: Cli) -> io::Result<i32> {
                             Action::Assemble {
                                 format, members, ..
                             } => format!("assemble: {format} ({} files)", members.len()),
+                            Action::Rewrite { format, .. } => format!("rewrite: {format}"),
+                            Action::RewritePartner { primary } => {
+                                format!("rewrite partner: {}", primary.0.display())
+                            }
                             _ => format!("{:?}", e.action),
                         };
                         println!(
@@ -505,13 +565,14 @@ async fn run(cli: Cli) -> io::Result<i32> {
                     force_signal.cancel();
                 }
             });
-            let result = run_job_with_archives(
+            let result = run_job_with_rewrites(
                 &plan,
                 &output,
                 &registry(),
                 &pack_registry(),
                 &envelope_registry(),
                 &archive_registry(),
+                &compressor_app::rewrite_registry(),
                 jobs,
                 token,
                 force,

@@ -13,6 +13,7 @@ compressor-engine-renpy.workspace = true
 compressor-engine-godot.workspace = true
 compressor-engine-rpgm.workspace = true
 compressor-engine-unity.workspace = true
+compressor-engine-unreal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio-util.workspace = true

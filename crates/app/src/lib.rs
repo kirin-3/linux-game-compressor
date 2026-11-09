@@ -24,6 +24,7 @@ pub struct Registries {
     pub engines: EngineRegistry,
     pub packs: PackRegistry,
     pub archives: ArchiveRegistry,
+    pub rewrites: compressor_core::registry::RewriteRegistry,
     pub envelopes: EnvelopeRegistry,
     pub engine_specs: BTreeMap<String, Vec<compressor_core::OptionSpec>>,
 }
@@ -36,6 +37,7 @@ pub fn registries(allow_unknown_version: bool) -> Registries {
         engines,
         packs: pack_registry(),
         archives: archive_registry(),
+        rewrites: rewrite_registry(),
         envelopes: envelope_registry(),
         engine_specs,
     }
@@ -69,6 +71,7 @@ pub fn engine_registry(allow: bool) -> EngineRegistry {
     engines.register(Arc::new(compressor_engine_unity::UnityAdapter {
         allow_unknown_version: allow,
     }));
+    engines.register(Arc::new(compressor_engine_unreal::UnrealAdapter));
     engines
 }
 pub fn pack_registry() -> PackRegistry {
@@ -82,6 +85,14 @@ pub fn pack_registry() -> PackRegistry {
 pub fn archive_registry() -> ArchiveRegistry {
     let mut registry = ArchiveRegistry::default();
     registry.register("unity-fs", Arc::new(compressor_engine_unity::UnityFs));
+    registry
+}
+pub fn rewrite_registry() -> compressor_core::registry::RewriteRegistry {
+    let mut registry = compressor_core::registry::RewriteRegistry::default();
+    registry.register(
+        compressor_engine_unreal::adapter::FORMAT,
+        Arc::new(compressor_engine_unreal::UnrealIoStore),
+    );
     registry
 }
 pub fn envelope_registry() -> EnvelopeRegistry {
@@ -133,6 +144,10 @@ pub fn plan_counts(plan: &Plan) -> BTreeMap<String, usize> {
             Action::Assemble {
                 format, members, ..
             } => format!("assemble: {format} ({} files)", members.len()),
+            Action::Rewrite { format, .. } => format!("rewrite: {format}"),
+            Action::RewritePartner { primary } => {
+                format!("rewrite partner: {}", primary.0.display())
+            }
         };
         *counts.entry(key).or_insert(0) += 1;
     }
@@ -273,6 +288,7 @@ pub struct InspectResult {
     pub engine: compressor_core::EngineInfo,
     pub rpgmaker: Option<RpgMakerInfo>,
     pub unity: Vec<UnityInfo>,
+    pub unreal: Vec<UnrealContainerInfo>,
     pub media: BTreeMap<String, MediaCount>,
     /// Additional GUI classification; omitted from the existing CLI inspection output.
     #[serde(skip)]
@@ -281,6 +297,45 @@ pub struct InspectResult {
     pub packs: Vec<PackInfo>,
     pub tools: Vec<(String, bool, BTreeMap<String, bool>)>,
     pub blockers: Vec<String>,
+}
+#[derive(serde::Serialize)]
+pub struct UnrealContainerInfo {
+    pub name: String,
+    /// The `.utoc` path relative to the game directory.
+    pub path: compressor_core::StoredPath,
+    pub toc_version: Option<u8>,
+    pub compressed: bool,
+    pub compression_methods: Vec<String>,
+    pub encrypted: bool,
+    pub signed: bool,
+    pub ucas_bytes: u64,
+    pub will_compress: bool,
+    /// Why the container is copied unchanged, when it is.
+    pub reason: Option<String>,
+}
+fn inspect_unreal(plan: &Plan) -> io::Result<Vec<UnrealContainerInfo>> {
+    if plan.engine.name != "Unreal Engine" {
+        return Ok(vec![]);
+    }
+    let settings = &plan.settings;
+    Ok(compressor_engine_unreal::adapter::inspect(
+        &plan.input_root.0,
+        compressor_engine_unreal::adapter::compress_enabled(settings),
+    )?
+    .into_iter()
+    .map(|c| UnrealContainerInfo {
+        name: c.name,
+        path: compressor_core::StoredPath(c.utoc),
+        toc_version: c.version,
+        compressed: c.compressed,
+        compression_methods: c.methods,
+        encrypted: c.encrypted,
+        signed: c.signed,
+        ucas_bytes: c.ucas_bytes,
+        will_compress: c.compress,
+        reason: c.reason.map(str::to_owned),
+    })
+    .collect())
 }
 #[derive(serde::Serialize)]
 pub struct UnityInfo {
@@ -367,6 +422,7 @@ pub fn inspect(game: &Path) -> io::Result<InspectResult> {
     let plan = new_plan(game, None, &[], false)?;
     let rpgmaker = inspect_rpgmaker(&plan)?;
     let unity = inspect_unity(&plan)?;
+    let unreal = inspect_unreal(&plan)?;
     let mut media = BTreeMap::<String, MediaCount>::new();
     let mut encrypted_media = BTreeMap::<String, MediaCount>::new();
     let mut archives = Vec::new();
@@ -466,6 +522,7 @@ pub fn inspect(game: &Path) -> io::Result<InspectResult> {
         engine: plan.engine,
         rpgmaker,
         unity,
+        unreal,
         media,
         encrypted_media,
         archives,
@@ -763,7 +820,92 @@ pub async fn verify(output: &Path) -> io::Result<VerifyResult> {
             }
         }
     }
+    verify_pairs(output, &manifest, &mut result).await?;
     Ok(result)
+}
+
+/// Check each rewritten pair by restoring the input bytes, and each pair kept as
+/// the original against its recorded input hashes.
+async fn verify_pairs(
+    output: &Path,
+    manifest: &compressor_core::Manifest,
+    result: &mut VerifyResult,
+) -> io::Result<()> {
+    let record = |path: &compressor_core::StoredPath| {
+        manifest
+            .entries
+            .iter()
+            .find(|r| r.member.is_none() && r.path == *path)
+    };
+    for entry in &manifest.plan.entries {
+        let Action::Rewrite {
+            format, partner, ..
+        } = &entry.action
+        else {
+            continue;
+        };
+        let Some(partner_entry) = manifest
+            .plan
+            .entries
+            .iter()
+            .find(|e| e.member.is_none() && e.path == *partner)
+        else {
+            result.errors.push(format!(
+                "{}: rewrite partner missing",
+                entry.path.0.display()
+            ));
+            continue;
+        };
+        let (Some(first), Some(second)) = (record(&entry.path), record(partner)) else {
+            continue; // Reported as a missing manifest record.
+        };
+        result.checked += 1;
+        if first.outcome == "rewritten" && second.outcome == "rewritten" {
+            let Some(handler) = rewrite_registry().get(format) else {
+                result.errors.push(format!(
+                    "{}: missing rewrite format",
+                    entry.path.0.display()
+                ));
+                continue;
+            };
+            let (primary_path, partner_path) =
+                (output.join(&entry.path.0), output.join(&partner.0));
+            let restored = tokio::task::spawn_blocking(move || {
+                handler.restore_hashes(&primary_path, &partner_path, &CancellationToken::new())
+            })
+            .await
+            .map_err(io::Error::other)?;
+            match restored {
+                Ok((primary, secondary)) => {
+                    for (path, restored, planned) in [
+                        (&entry.path, primary, entry),
+                        (partner, secondary, partner_entry),
+                    ] {
+                        if restored != (planned.size, planned.hash.clone()) {
+                            result.errors.push(format!(
+                                "{}: restored bytes differ from the input",
+                                path.0.display()
+                            ));
+                        }
+                    }
+                }
+                Err(error) => result.errors.push(format!(
+                    "{}: cannot restore the input: {error}",
+                    entry.path.0.display()
+                )),
+            }
+        } else {
+            for (record, planned) in [(first, entry), (second, partner_entry)] {
+                if record.output_hash.as_ref() != Some(&planned.hash) {
+                    result.errors.push(format!(
+                        "{}: differs from the input",
+                        planned.path.0.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // Resolve existing components, including symlinks, before comparing paths.
@@ -919,6 +1061,34 @@ pub fn unsupported_reason(result: &InspectResult) -> Option<String> {
             .join(", ");
         return Some(format!("unsupported Unity version: {versions}"));
     }
+    // Containers that are already compressed, encrypted, or signed are queued and copied;
+    // only a game whose containers all have an unsupported version is refused.
+    let game_containers: Vec<_> = result
+        .unreal
+        .iter()
+        .filter(|c| c.name != "global")
+        .collect();
+    if !game_containers.is_empty()
+        && game_containers
+            .iter()
+            .all(|c| c.reason.as_deref() == Some("unsupported container version"))
+    {
+        let mut folders: Vec<String> = game_containers
+            .iter()
+            .map(|c| {
+                c.path
+                    .0
+                    .parent()
+                    .map_or_else(|| ".".to_owned(), |p| p.display().to_string())
+            })
+            .collect();
+        folders.sort();
+        folders.dedup();
+        return Some(format!(
+            "unsupported container version in {}",
+            folders.join(", ")
+        ));
+    }
     None
 }
 
@@ -993,6 +1163,49 @@ mod unsupported_tests {
                     (&b.path, &b.member, b.size, &b.action)
                 );
             }
+        }
+        Ok(())
+    }
+    #[test]
+    fn unreal_games_with_unsupported_versions_are_refused() -> io::Result<()> {
+        use compressor_test_fixtures::iostore::{self, Chunk, Options};
+        let make = |options: Options| -> io::Result<tempfile::TempDir> {
+            let dir = tempfile::tempdir()?;
+            let paks = dir.path().join("Game/P/Content/Paks");
+            std::fs::create_dir_all(&paks)?;
+            std::fs::create_dir_all(dir.path().join("Game/Engine"))?;
+            let built = iostore::build(
+                &[Chunk {
+                    kind: 2,
+                    data: iostore::sample_bytes(1, 9000),
+                }],
+                &options,
+            );
+            std::fs::write(paks.join("P-Windows.utoc"), built.utoc)?;
+            std::fs::write(paks.join("P-Windows.ucas"), built.ucas)?;
+            Ok(dir)
+        };
+        let old = make(Options {
+            version: 3,
+            ..Options::default()
+        })?;
+        let reason = unsupported_reason(&inspect(old.path())?).unwrap();
+        assert!(reason.contains("unsupported container version"), "{reason}");
+        assert!(reason.contains("Game/P/Content/Paks"), "{reason}");
+        for options in [
+            Options {
+                flags: iostore::FLAG_COMPRESSED | iostore::FLAG_INDEXED,
+                method_names: vec!["Oodle".into()],
+                ..Options::default()
+            },
+            Options {
+                flags: iostore::FLAG_ENCRYPTED,
+                ..Options::default()
+            },
+            Options::default(),
+        ] {
+            let game = make(options)?;
+            assert_eq!(unsupported_reason(&inspect(game.path())?), None);
         }
         Ok(())
     }

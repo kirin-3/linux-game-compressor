@@ -1,7 +1,8 @@
 //! Sampling-based, read-only output-size estimates.
 use compressor_core::{
-    planning::preview_plan, registry::ArchiveInput, Action, Entry, MediaKind, Plan,
-    ResolvedSettings,
+    planning::preview_plan,
+    registry::{ArchiveInput, RewriteInput},
+    Action, Entry, MediaKind, Plan, ResolvedSettings,
 };
 use std::{
     collections::BTreeMap,
@@ -197,6 +198,57 @@ async fn estimate_plan(
                 base += bytes as f64;
                 maximum += entry.size as f64;
             }
+            Action::Rewrite {
+                format, partner, ..
+            } => {
+                let partner_entry = plan
+                    .entries
+                    .iter()
+                    .find(|e| e.member.is_none() && e.path == *partner)
+                    .ok_or_else(|| io::Error::other("rewrite partner missing from plan"))?;
+                let input = |e: &Entry| RewriteInput {
+                    path: plan.input_root.0.join(&e.path.0),
+                    size: e.size,
+                    hash: e.hash.clone(),
+                };
+                let (primary_input, partner_input) = (input(entry), input(partner_entry));
+                let handler = regs
+                    .rewrites
+                    .get(format)
+                    .ok_or_else(|| io::Error::other("missing rewrite format"))?;
+                let ratio = loop {
+                    let permit = if let Some(limiter) = &options.limiter {
+                        Some(limiter.acquire(sample_path(plan, entry), cancel).await?)
+                    } else {
+                        None
+                    };
+                    let sample_cancel = permit
+                        .as_ref()
+                        .map_or_else(|| cancel.child_token(), |p| p.cancel.clone());
+                    let handler = handler.clone();
+                    let (primary_input, partner_input) =
+                        (primary_input.clone(), partner_input.clone());
+                    let token = sample_cancel.clone();
+                    let ratio = tokio::task::spawn_blocking(move || {
+                        handler.estimate_ratio(&primary_input, &partner_input, 1024, &token)
+                    })
+                    .await
+                    .map_err(io::Error::other)?;
+                    cancelled(cancel)?;
+                    if sample_cancel.is_cancelled() {
+                        drop(permit);
+                        continue;
+                    }
+                    break ratio?.unwrap_or(1.0);
+                };
+                let total = entry.size + partner_entry.size;
+                let bytes = (total as f64 * ratio).round() as u64;
+                *estimate.breakdown.entry("rewrite".into()).or_insert(0) += bytes;
+                base += bytes as f64;
+                maximum += total as f64;
+            }
+            // The primary's entry accounts for both files of a pair.
+            Action::RewritePartner { .. } => {}
             _ => {}
         }
     }
@@ -576,6 +628,89 @@ mod tests {
         let result = estimate_plan(&plan, &options, &token, &mut |_, _| token.cancel()).await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
         assert!(std::fs::read_dir(scratch.path())?.next().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn breakdown_adds_every_unreal_container_pair() -> io::Result<()> {
+        use compressor_test_fixtures::iostore::{self, Chunk, Options};
+        let game = tempfile::tempdir()?;
+        let paks = game.path().join("Game/P/Content/Paks");
+        std::fs::create_dir_all(&paks)?;
+        std::fs::create_dir_all(game.path().join("Game/Engine"))?;
+        for name in ["pakchunk0-Windows", "pakchunk1-Windows"] {
+            let chunks: Vec<Chunk> = (0..20u8)
+                .map(|i| Chunk {
+                    kind: 2,
+                    data: iostore::sample_bytes(i, 9000),
+                })
+                .collect();
+            let built = iostore::build(&chunks, &Options::default());
+            std::fs::write(paks.join(format!("{name}.utoc")), &built.utoc)?;
+            std::fs::write(paks.join(format!("{name}.ucas")), &built.ucas)?;
+        }
+        let result = estimate(
+            game.path(),
+            &ResolvedSettings::default(),
+            &EstimateOptions::default(),
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await?;
+        assert!(result.likely > 0);
+        assert!(result.breakdown["rewrite"].abs_diff(result.likely) <= 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn estimates_unreal_container_pairs() -> io::Result<()> {
+        use compressor_test_fixtures::iostore::{self, Chunk, Options};
+        let game = tempfile::tempdir()?;
+        let paks = game.path().join("Game/P/Content/Paks");
+        std::fs::create_dir_all(&paks)?;
+        std::fs::create_dir_all(game.path().join("Game/Engine"))?;
+        let chunks: Vec<Chunk> = (0..80u8)
+            .map(|i| Chunk {
+                kind: if i % 10 == 0 { 9 } else { 2 },
+                data: iostore::sample_bytes(i, 9000 + 37 * i as usize),
+            })
+            .collect();
+        let built = iostore::build(&chunks, &Options::default());
+        std::fs::write(paks.join("P-Windows.utoc"), &built.utoc)?;
+        std::fs::write(paks.join("P-Windows.ucas"), &built.ucas)?;
+        std::fs::write(paks.join("Intro.mp4"), vec![7u8; 5000])?;
+        let result = estimate(
+            game.path(),
+            &ResolvedSettings::default(),
+            &EstimateOptions::default(),
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await?;
+        let input = (built.utoc.len() + built.ucas.len()) as u64;
+        // Compare with the real rewrite of the same pair.
+        let out = tempfile::tempdir()?;
+        compressor_engine_unreal::writer::rewrite(
+            &paks.join("P-Windows.utoc"),
+            &paks.join("P-Windows.ucas"),
+            &out.path().join("o.utoc"),
+            &out.path().join("o.ucas"),
+            &CancellationToken::new(),
+        )?;
+        let actual = std::fs::metadata(out.path().join("o.utoc"))?.len()
+            + std::fs::metadata(out.path().join("o.ucas"))?.len()
+            + 5000;
+        assert!(
+            result.likely < input + 5000
+                && result.low <= result.likely
+                && result.likely <= result.high
+        );
+        assert!(
+            (result.likely as f64 - actual as f64).abs() < actual as f64 * 0.10,
+            "{} vs {actual}",
+            result.likely
+        );
+        assert!(result.breakdown.contains_key("rewrite"));
         Ok(())
     }
 }

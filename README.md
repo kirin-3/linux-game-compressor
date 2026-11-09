@@ -5,7 +5,7 @@
 <h1 align="center">Linux Game Compressor</h1>
 
 <p align="center">
-  Make Ren'Py, Godot, Unity and RPG Maker games smaller without breaking them.
+  Make Ren'Py, Godot, Unity, Unreal Engine and RPG Maker games smaller without breaking them.
 </p>
 
 <p align="center">
@@ -37,7 +37,8 @@ game is never modified.
   as is. Each output is verified against its manifest when it finishes.
 - **Resumable.** An interrupted job continues where it stopped.
 - **Engine-aware.** Rebuilds Godot `.pck` packs, re-encrypts RPG Maker
-  assets with the game's key, and repacks Unity player data losslessly.
+  assets with the game's key, repacks Unity player data losslessly, and
+  compresses raw Unreal Engine containers losslessly.
 - **One file.** The desktop app and the command-line tool are a single
   executable with identical settings. Nothing to unpack.
 
@@ -49,6 +50,7 @@ game is never modified.
 | Godot 4 | 4.x | Images and audio, including members of `.pck` packs, which are rebuilt. |
 | RPG Maker MV / MZ | MV and MZ | Images, audio and video, including encrypted assets; unused `.m4a` twins are removed. |
 | Unity | 2020.1 – 2023.2, Unity 6 | Player data repacked into a lossless LZ4HC `data.unity3d`. |
+| Unreal Engine 5 | Packaged games with IoStore containers; load-tested on 5.5 | Raw `.ucas`/`.utoc` containers get lossless Zlib blocks. Containers that are already compressed, encrypted or signed, `global`, and `.pak` files are copied unchanged. |
 
 See [docs/compatibility.md](docs/compatibility.md) for results on real games
 and the details for each engine.

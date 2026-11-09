@@ -710,6 +710,40 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("2019.4.40f1"));
+        use compressor_test_fixtures::iostore::{self, Chunk, Options};
+        let unreal = |options: Options| {
+            let dir = tempfile::tempdir().unwrap();
+            let paks = dir.path().join("Game/P/Content/Paks");
+            std::fs::create_dir_all(&paks).unwrap();
+            std::fs::create_dir_all(dir.path().join("Game/Engine")).unwrap();
+            let chunk = Chunk {
+                kind: 2,
+                data: iostore::sample_bytes(1, 9000),
+            };
+            let built = iostore::build(&[chunk], &options);
+            std::fs::write(paks.join("P-Windows.utoc"), built.utoc).unwrap();
+            std::fs::write(paks.join("P-Windows.ucas"), built.ucas).unwrap();
+            dir
+        };
+        let old = unreal(Options {
+            version: 3,
+            ..Options::default()
+        });
+        let error = check_game(old.path()).err().unwrap().to_string();
+        assert!(error.contains("unsupported container version"), "{error}");
+        assert!(error.contains("Game/P/Content/Paks"), "{error}");
+        let compressed = unreal(Options {
+            flags: iostore::FLAG_COMPRESSED | iostore::FLAG_INDEXED,
+            method_names: vec!["Oodle".into()],
+            ..Options::default()
+        });
+        let checked = check_game(compressed.path()).unwrap();
+        assert_eq!(checked.result.engine.name, "Unreal Engine");
+        assert!(checked
+            .result
+            .unreal
+            .iter()
+            .all(|c| c.reason.as_deref() == Some("already compressed container")));
         let renpy = compressor_test_fixtures::Fixture::new().unwrap();
         let checked = check_game(renpy.root()).unwrap();
         assert_eq!(checked.result.engine.name, "Ren'Py");

@@ -363,7 +363,7 @@ fn probe_tools() -> Vec<String> {
         }
     }
     let mut plan = compressor_core::Plan {
-        plan_version: 5,
+        plan_version: 6,
         input_root: compressor_core::StoredPath(std::path::PathBuf::new()),
         engine: compressor_core::EngineInfo {
             name: "probe".into(),

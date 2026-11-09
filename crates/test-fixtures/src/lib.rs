@@ -1,5 +1,7 @@
 //! Synthetic Ren'Py trees for tests; never used by the shipped application.
 
+pub mod iostore;
+
 use std::fs;
 use std::io;
 use std::os::unix::fs::{symlink, PermissionsExt};

@@ -142,6 +142,21 @@ Manor saves little because most of its content is in asset bundles that are alre
 
 All three outputs passed `compressor verify`. Under Wine, each player logged that it loaded player data from `data.unity3d` and reached its first screen. Each archive is the same size as the archive from the format spike. The user played the spike's archived builds of UNITY_1 and UNITY_3: both started, played, and had working audio. Manor's archived build was checked headless through a new game, with its music playing.
 
+# Unreal Engine
+
+Unreal Engine 5 games are detected from `Content/Paks/*.utoc` containers with an `Engine` folder beside the project. Only raw IoStore containers (table-of-contents version 8, one partition, no compression, encryption or signing) are rewritten: each block gets lossless Zlib level 9 when that makes it smaller, and shader code, the shader library and the container header stay raw. File names, chunk ids, chunk hashes and the directory index do not change. Everything else, including `global`, `.pak` files, executables and movies, is copied unchanged. The output is checked by restoring the original `.ucas` and `.utoc` bytes from it and comparing their hashes with the input.
+
+| Game | Engine | Containers | Result |
+| --- | --- | --- | --- |
+| UNREAL_2 | 5.5 | `EscapeFrom-Windows` raw, `global` raw | 5,722,886,942 to 2,860,270,448 bytes (50.02% saved) in 70 s; `verify` passes (40 files) |
+| UNREAL_1 | 5.7.4 | `prealpha-Windows` Oodle, `global` raw | Every file byte-identical to the input; plan notes "already compressed container"; `verify` passes (78 files) |
+
+- **Estimate.** The desktop estimate for UNREAL_2 was 2,878,966,598 bytes against 2,860,270,448 measured (0.65% high). It samples 1,024 evenly spaced blocks; a first try with 32 blocks was 20% low, because compressibility varies across a container.
+- **Load test.** Only UE 5.5 is load-tested: under Proton, the unmodified UNREAL_2, a script-rewritten copy, and the output of this tool all start, load a level and play (user reports, 2026-11-09). Wine 11.21 shows no log or first screen for either copy, so it cannot decide. UE 5.7 has no raw example game, so its containers are only ever copied.
+- **Not covered.** Other table-of-contents versions, several partitions, encrypted, signed and already compressed containers are copied unchanged. Movies and other loose files are not converted.
+- **`SHA256SUMS.txt`.** Games such as UNREAL_2 ship this file. The game does not read it, but the hashes of the two rewritten files no longer match it.
+- **Never start a game from `example_games/`**: running it writes `Saved/` beside it. Use a copy.
+
 # Desktop size estimates
 
 Measured with the three built-in profiles and the balanced compression on the example games. Values are MiB; each estimate is the likely value followed by its low–high range. Measurements use 24 image, 48 audio, and 3 video samples, with eight-second video clips.

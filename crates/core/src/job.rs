@@ -4,7 +4,8 @@ use crate::{
     output::check_output,
     planning::{hash_input, validate_plan_with_cancel},
     registry::{
-        ArchiveInput, ArchiveRegistry, EnvelopeRegistry, PackRegistry, TransformerRegistry,
+        ArchiveInput, ArchiveRegistry, EnvelopeRegistry, PackRegistry, RewriteInput,
+        RewriteRegistry, TransformerRegistry,
     },
     scheduler::{transform_one_with_force, ConversionOutcome},
     tools::check_tools,
@@ -161,6 +162,36 @@ pub async fn run_job_with_archives(
     force: CancellationToken,
     events: broadcast::Sender<Event>,
 ) -> io::Result<Report> {
+    run_job_with_rewrites(
+        plan,
+        output,
+        registry,
+        packs,
+        envelopes,
+        archives,
+        &RewriteRegistry::default(),
+        jobs,
+        cancel,
+        force,
+        events,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_job_with_rewrites(
+    plan: &Plan,
+    output: &Path,
+    registry: &TransformerRegistry,
+    packs: &PackRegistry,
+    envelopes: &EnvelopeRegistry,
+    archives: &ArchiveRegistry,
+    rewrites: &RewriteRegistry,
+    jobs: usize,
+    cancel: CancellationToken,
+    force: CancellationToken,
+    events: broadcast::Sender<Event>,
+) -> io::Result<Report> {
     if jobs == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -200,6 +231,14 @@ pub async fn run_job_with_archives(
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("missing archive format: {format}"),
+                ));
+            }
+        }
+        if let Action::Rewrite { format, .. } = &entry.action {
+            if rewrites.get(format).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("missing rewrite format: {format}"),
                 ));
             }
         }
@@ -249,7 +288,11 @@ pub async fn run_job_with_archives(
     for (index, entry) in plan.entries.iter().enumerate() {
         if matches!(
             entry.action,
-            Action::Rebuild { .. } | Action::Archive { .. } | Action::Assemble { .. }
+            Action::Rebuild { .. }
+                | Action::Archive { .. }
+                | Action::Assemble { .. }
+                | Action::Rewrite { .. }
+                | Action::RewritePartner { .. }
         ) {
             continue;
         }
@@ -814,6 +857,174 @@ pub async fn run_job_with_archives(
             });
         }
     }
+    // Rewritten pairs run last, after all copy and convert work, one pair at a time.
+    if first_error.is_none() && !cancel.is_cancelled() {
+        for (index, entry) in plan
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e.action, Action::Rewrite { .. }))
+        {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let Action::Rewrite {
+                format,
+                params,
+                partner,
+            } = &entry.action
+            else {
+                unreachable!()
+            };
+            let handler = rewrites
+                .get(format)
+                .expect("preflight checked rewrite format");
+            let (partner_index, partner_entry) = plan
+                .entries
+                .iter()
+                .enumerate()
+                .find(|(_, e)| e.member.is_none() && e.path == *partner)
+                .expect("validated rewrite partner");
+            let pair = [(index, entry), (partner_index, partner_entry)];
+            if let (Some(a), Some(b)) = (
+                completed.get(&(entry.path.clone(), None)),
+                completed.get(&(partner_entry.path.clone(), None)),
+            ) {
+                for record in [a, b] {
+                    done += 1;
+                    saved += i128::from(record.input_size) - i128::from(record.output_size);
+                    let _ = events.send(Event::FileResult {
+                        path: record.path.clone(),
+                        outcome: record.outcome.clone(),
+                        done,
+                        total,
+                        bytes_saved: saved,
+                    });
+                }
+                continue;
+            }
+            let _ = events.send(Event::FileStart {
+                path: entry.path.clone(),
+                done,
+                total,
+                bytes_saved: saved,
+            });
+            // A pair that was not recorded as complete must not keep one old file.
+            for (_, pair_entry) in pair {
+                match std::fs::remove_file(output.join(&pair_entry.path.0)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let temporaries = pair.map(|(i, _)| metadata.join("tmp").join(format!("{i}.rewrite")));
+            let inputs = pair.map(|(_, e)| RewriteInput {
+                path: plan.input_root.0.join(&e.path.0),
+                size: e.size,
+                hash: e.hash.clone(),
+            });
+            let result = {
+                let handler = handler.clone();
+                let params = params.clone();
+                let token = cancel.clone();
+                let temporaries = temporaries.clone();
+                let inputs = inputs.clone();
+                tokio::task::spawn_blocking(move || -> io::Result<[u64; 2]> {
+                    handler.write(
+                        &inputs[0],
+                        &inputs[1],
+                        &temporaries[0],
+                        &temporaries[1],
+                        &params,
+                        &token,
+                    )?;
+                    let (first, second) =
+                        handler.restore_hashes(&temporaries[0], &temporaries[1], &token)?;
+                    if first != (inputs[0].size, inputs[0].hash.clone())
+                        || second != (inputs[1].size, inputs[1].hash.clone())
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "rewritten files do not restore the input",
+                        ));
+                    }
+                    Ok([
+                        std::fs::metadata(&temporaries[0])?.len(),
+                        std::fs::metadata(&temporaries[1])?.len(),
+                    ])
+                })
+                .await
+                .map_err(io::Error::other)?
+            };
+            if cancel.is_cancelled() {
+                for temporary in &temporaries {
+                    let _ = std::fs::remove_file(temporary);
+                }
+                break;
+            }
+            let (outcome, failure) = match result {
+                Ok(sizes) if sizes[0] + sizes[1] < entry.size + partner_entry.size => {
+                    for ((_, e), temporary) in pair.iter().zip(&temporaries) {
+                        ensure_output_parent(&output, &e.path.0)?;
+                        copy::preserve_metadata(&plan.input_root.0.join(&e.path.0), temporary)?;
+                    }
+                    for ((_, e), temporary) in pair.iter().zip(&temporaries) {
+                        std::fs::rename(temporary, output.join(&e.path.0))?;
+                    }
+                    ("rewritten".to_owned(), false)
+                }
+                other => {
+                    for temporary in &temporaries {
+                        let _ = std::fs::remove_file(temporary);
+                    }
+                    let (outcome, failure) = match other {
+                        Ok(_) => ("kept original: not smaller".to_owned(), false),
+                        Err(error) => (format!("rewrite failed: {error}"), true),
+                    };
+                    for ((_, e), temporary) in pair.iter().zip(&temporaries) {
+                        ensure_output_parent(&output, &e.path.0)?;
+                        copy::stage_copy_entry(&plan.input_root.0, &output, &e.path.0, temporary)?;
+                        if hash_input(temporary)? != (e.size, e.hash.clone()) {
+                            let _ = std::fs::remove_file(temporary);
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("stale plan: {}", e.path.0.display()),
+                            ));
+                        }
+                        std::fs::rename(temporary, output.join(&e.path.0))?;
+                    }
+                    (outcome, failure)
+                }
+            };
+            for (_, e) in pair {
+                let (size, hash) = hash_input(&output.join(&e.path.0))?;
+                let record = JournalEntry {
+                    path: e.path.clone(),
+                    member: None,
+                    plan_hash: plan_hash.clone(),
+                    input_hash: e.hash.clone(),
+                    output_hash: Some(hash),
+                    input_size: e.size,
+                    output_size: size,
+                    outcome: outcome.clone(),
+                    failure,
+                };
+                journal
+                    .lock()
+                    .map_err(|_| io::Error::other("journal lock poisoned"))?
+                    .append(&record)?;
+                done += 1;
+                saved += i128::from(record.input_size) - i128::from(record.output_size);
+                let _ = events.send(Event::FileResult {
+                    path: e.path.clone(),
+                    outcome: record.outcome,
+                    done,
+                    total,
+                    bytes_saved: saved,
+                });
+            }
+        }
+    }
     let journal = journal
         .lock()
         .map_err(|_| io::Error::other("journal lock poisoned"))?;
@@ -920,7 +1131,7 @@ mod tests {
         let data = input.join("large.dat");
         std::fs::File::create(&data)?.set_len(1024 * 1024 * 1024)?;
         let plan = Plan {
-            plan_version: 5,
+            plan_version: 6,
             input_root: crate::StoredPath(input.canonicalize()?),
             engine: EngineInfo {
                 name: "test".into(),
@@ -1055,7 +1266,7 @@ mod tests {
         std::fs::File::create(&source)?.set_len(1024 * 1024 * 1024)?;
         let (size, hash) = crate::planning::hash_input(&source)?;
         let plan = Plan {
-            plan_version: 5,
+            plan_version: 6,
             input_root: crate::StoredPath(input.canonicalize()?),
             engine: EngineInfo {
                 name: "test".into(),
@@ -1214,7 +1425,7 @@ mod tests {
         std::fs::write(input.join("level0"), vec![42; 100])?;
         let (size, hash) = hash_input(&input.join("level0"))?;
         let plan = Plan {
-            plan_version: 5,
+            plan_version: 6,
             input_root: StoredPath(input),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -1544,7 +1755,7 @@ mod tests {
             })
             .collect();
         let plan = Plan {
-            plan_version: 5,
+            plan_version: 6,
             input_root: StoredPath(input.clone()),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -1687,7 +1898,7 @@ mod tests {
             },
         );
         let mut plan = Plan {
-            plan_version: 5,
+            plan_version: 6,
             input_root: StoredPath(root.into()),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -1747,7 +1958,7 @@ mod tests {
         let settings = crate::ResolvedSettings::default();
         let path = StoredPath("game.pck".into());
         let plan = Plan {
-            plan_version: 5,
+            plan_version: 6,
             input_root: StoredPath(input.canonicalize()?),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -1890,7 +2101,7 @@ mod tests {
             settings: crate::ConvertSettings::Image(settings.image()),
         };
         let plan = Plan {
-            plan_version: 5,
+            plan_version: 6,
             input_root: StoredPath(input.canonicalize()?),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -2009,7 +2220,7 @@ mod tests {
         std::fs::write(input.join("unused.m4a"), b"unused")?;
         let (size, hash) = hash_input(&input.join("unused.m4a"))?;
         let plan = Plan {
-            plan_version: 5,
+            plan_version: 6,
             input_root: StoredPath(input),
             engine: EngineInfo {
                 name: "fake".into(),
@@ -2157,6 +2368,347 @@ mod tests {
             }
             assert_eq!(snapshot(&input)?, initial, "input changed during {mode}");
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod rewrite_tests {
+    use super::*;
+    use crate::registry::RewriteFormat;
+    use crate::{EngineInfo, Entry};
+
+    /// Output is `[u64 length][bytes with the zero tail removed]`; `mode` picks a fault.
+    struct FakePair(Arc<AtomicUsize>);
+    fn shrink(bytes: &[u8], mode: &str) -> Vec<u8> {
+        let mut out = (bytes.len() as u64).to_le_bytes().to_vec();
+        let end = if mode == "inflate" {
+            bytes.len()
+        } else {
+            bytes.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1)
+        };
+        out.extend(&bytes[..end]);
+        if mode == "corrupt" && out.len() > 8 {
+            out[8] ^= 1;
+        }
+        out
+    }
+    impl RewriteFormat for FakePair {
+        fn write(
+            &self,
+            primary: &RewriteInput,
+            partner: &RewriteInput,
+            primary_output: &Path,
+            partner_output: &Path,
+            params: &serde_json::Value,
+            cancel: &CancellationToken,
+        ) -> io::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let mode = params["mode"].as_str().unwrap_or("ok");
+            if mode == "fail" {
+                return Err(io::Error::other("disk full"));
+            }
+            std::fs::write(primary_output, shrink(&std::fs::read(&primary.path)?, mode))?;
+            std::fs::write(partner_output, shrink(&std::fs::read(&partner.path)?, mode))?;
+            if mode == "cancel" {
+                cancel.cancel();
+            }
+            Ok(())
+        }
+        fn restore_hashes(
+            &self,
+            primary_output: &Path,
+            partner_output: &Path,
+            _: &CancellationToken,
+        ) -> io::Result<((u64, String), (u64, String))> {
+            let restore = |path: &Path| -> io::Result<(u64, String)> {
+                let bytes = std::fs::read(path)?;
+                let len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+                let mut original = bytes[8..].to_vec();
+                original.resize(len, 0);
+                Ok((len as u64, blake3::hash(&original).to_hex().to_string()))
+            };
+            Ok((restore(primary_output)?, restore(partner_output)?))
+        }
+    }
+
+    struct Case {
+        _temp: tempfile::TempDir,
+        input: std::path::PathBuf,
+        output: std::path::PathBuf,
+        plan: Plan,
+        writes: Arc<AtomicUsize>,
+        rewrites: RewriteRegistry,
+    }
+    fn case(mode: &str) -> io::Result<Case> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("input");
+        std::fs::create_dir_all(input.join("Paks"))?;
+        let mut data = vec![7u8; 10];
+        data.resize(4000, 0);
+        std::fs::write(input.join("Paks/g.ucas"), &data)?;
+        data.resize(1000, 0);
+        std::fs::write(input.join("Paks/g.utoc"), &data)?;
+        std::fs::write(input.join("readme.txt"), b"hello")?;
+        let entry = |path: &str, action| -> io::Result<Entry> {
+            let (size, hash) = hash_input(&input.join(path))?;
+            Ok(Entry {
+                path: StoredPath(path.into()),
+                member: None,
+                size,
+                hash,
+                action,
+            })
+        };
+        let plan = Plan {
+            plan_version: 6,
+            input_root: StoredPath(input.canonicalize()?),
+            engine: EngineInfo {
+                name: "fake".into(),
+                version: None,
+                excluded_paths: vec![],
+                notes: vec![],
+                version_check_overridden: false,
+            },
+            settings: Default::default(),
+            tools: vec![],
+            entries: vec![
+                entry(
+                    "Paks/g.ucas",
+                    Action::Rewrite {
+                        format: "fake".into(),
+                        params: serde_json::json!({ "mode": mode }),
+                        partner: StoredPath("Paks/g.utoc".into()),
+                    },
+                )?,
+                entry(
+                    "Paks/g.utoc",
+                    Action::RewritePartner {
+                        primary: StoredPath("Paks/g.ucas".into()),
+                    },
+                )?,
+                entry(
+                    "readme.txt",
+                    Action::Copy {
+                        reason: "other game file".into(),
+                    },
+                )?,
+            ],
+        };
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut rewrites = RewriteRegistry::default();
+        rewrites.register("fake", Arc::new(FakePair(writes.clone())));
+        Ok(Case {
+            output: temp.path().join("output"),
+            _temp: temp,
+            input,
+            plan,
+            writes,
+            rewrites,
+        })
+    }
+    async fn run(case: &Case, cancel: CancellationToken) -> io::Result<journal::Report> {
+        let (events, _) = broadcast::channel(16);
+        run_job_with_rewrites(
+            &case.plan,
+            &case.output,
+            &TransformerRegistry::default(),
+            &PackRegistry::default(),
+            &EnvelopeRegistry::default(),
+            &ArchiveRegistry::default(),
+            &case.rewrites,
+            2,
+            cancel,
+            CancellationToken::new(),
+            events,
+        )
+        .await
+    }
+    fn same_as_input(case: &Case, path: &str) -> bool {
+        std::fs::read(case.input.join(path)).unwrap()
+            == std::fs::read(case.output.join(path)).unwrap()
+    }
+    fn records(case: &Case) -> Vec<JournalEntry> {
+        crate::planning::read_manifest(&case.output.join(".compressor/manifest.json"))
+            .unwrap()
+            .entries
+    }
+
+    #[tokio::test]
+    async fn smaller_pair_is_used() -> io::Result<()> {
+        let case = case("ok")?;
+        let report = run(&case, CancellationToken::new()).await?;
+        assert!(report.complete);
+        assert_eq!(
+            std::fs::metadata(case.output.join("Paks/g.ucas"))?.len(),
+            18
+        );
+        assert!(std::fs::read_dir(case.output.join(".compressor/tmp"))?
+            .next()
+            .is_none());
+        let records = records(&case);
+        assert_eq!(
+            records.iter().filter(|r| r.outcome == "rewritten").count(),
+            2
+        );
+        assert!(records.iter().all(|r| !r.failure));
+        assert!(same_as_input(&case, "readme.txt"));
+        // The report shows the pair's combined sizes and the total saved.
+        assert_eq!(report.rewrites.len(), 1);
+        let summary = &report.rewrites[0];
+        assert_eq!(summary.path.0, Path::new("Paks/g.ucas"));
+        assert_eq!(summary.partner.0, Path::new("Paks/g.utoc"));
+        assert_eq!((summary.input_bytes, summary.output_bytes), (5000, 36));
+        assert_eq!(report.savings_by_media["data"], 5000 - 36);
+        assert!(report.skips.iter().all(|r| r.outcome != "rewritten"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pair_that_is_not_smaller_is_copied() -> io::Result<()> {
+        let case = case("inflate")?;
+        run(&case, CancellationToken::new()).await?;
+        assert!(same_as_input(&case, "Paks/g.ucas") && same_as_input(&case, "Paks/g.utoc"));
+        let records = records(&case);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r.outcome == "kept original: not smaller" && !r.failure)
+                .count(),
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_failure_and_restore_mismatch_copy_the_pair() -> io::Result<()> {
+        for (mode, text) in [("fail", "disk full"), ("corrupt", "do not restore")] {
+            let case = case(mode)?;
+            run(&case, CancellationToken::new()).await?;
+            assert!(same_as_input(&case, "Paks/g.ucas") && same_as_input(&case, "Paks/g.utoc"));
+            let records = records(&case);
+            let failed: Vec<_> = records.iter().filter(|r| r.failure).collect();
+            assert_eq!(failed.len(), 2, "{mode}");
+            assert!(failed
+                .iter()
+                .all(|r| r.outcome.starts_with("rewrite failed") && r.outcome.contains(text)));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_input_is_refused_before_any_output() -> io::Result<()> {
+        let case = case("ok")?;
+        std::fs::write(case.input.join("Paks/g.utoc"), b"changed")?;
+        let error = run(&case, CancellationToken::new()).await.unwrap_err();
+        assert!(error.to_string().contains("stale plan"), "{error}");
+        assert_eq!(case.writes.load(Ordering::SeqCst), 0);
+        assert!(!case.output.join("Paks/g.ucas").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_write_leaves_no_pair_files() -> io::Result<()> {
+        let case = case("cancel")?;
+        let error = run(&case, CancellationToken::new()).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!case.output.join("Paks/g.ucas").exists());
+        assert!(!case.output.join("Paks/g.utoc").exists());
+        assert!(std::fs::read_dir(case.output.join(".compressor/tmp"))?
+            .next()
+            .is_none());
+        assert!(
+            !crate::planning::read_manifest(&case.output.join(".compressor/manifest.json"))?
+                .complete
+        );
+        Ok(())
+    }
+
+    /// Counts how many of the output files of a pair exist while it is written.
+    struct WatchPair {
+        inner: FakePair,
+        watched: [std::path::PathBuf; 2],
+        seen: Arc<AtomicUsize>,
+    }
+    impl RewriteFormat for WatchPair {
+        fn write(
+            &self,
+            primary: &RewriteInput,
+            partner: &RewriteInput,
+            primary_output: &Path,
+            partner_output: &Path,
+            params: &serde_json::Value,
+            cancel: &CancellationToken,
+        ) -> io::Result<()> {
+            let existing = self.watched.iter().filter(|path| path.exists()).count();
+            self.seen.fetch_add(existing, Ordering::SeqCst);
+            self.inner.write(
+                primary,
+                partner,
+                primary_output,
+                partner_output,
+                params,
+                cancel,
+            )
+        }
+        fn restore_hashes(
+            &self,
+            primary_output: &Path,
+            partner_output: &Path,
+            cancel: &CancellationToken,
+        ) -> io::Result<((u64, String), (u64, String))> {
+            self.inner
+                .restore_hashes(primary_output, partner_output, cancel)
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_removes_both_files_of_a_partial_pair_first() -> io::Result<()> {
+        let mut case = case("ok")?;
+        run(&case, CancellationToken::new()).await?;
+        std::fs::write(case.output.join("Paks/g.utoc"), b"tampered")?;
+        let seen = Arc::new(AtomicUsize::new(0));
+        let mut rewrites = RewriteRegistry::default();
+        rewrites.register(
+            "fake",
+            Arc::new(WatchPair {
+                inner: FakePair(case.writes.clone()),
+                watched: [
+                    case.output.join("Paks/g.ucas"),
+                    case.output.join("Paks/g.utoc"),
+                ],
+                seen: seen.clone(),
+            }),
+        );
+        case.rewrites = rewrites;
+        run(&case, CancellationToken::new()).await?;
+        assert_eq!(case.writes.load(Ordering::SeqCst), 2);
+        assert_eq!(seen.load(Ordering::SeqCst), 0, "old pair files were kept");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_a_complete_pair_and_redoes_a_partial_one() -> io::Result<()> {
+        let case = case("ok")?;
+        run(&case, CancellationToken::new()).await?;
+        assert_eq!(case.writes.load(Ordering::SeqCst), 1);
+        run(&case, CancellationToken::new()).await?;
+        assert_eq!(
+            case.writes.load(Ordering::SeqCst),
+            1,
+            "complete pair resumed"
+        );
+        std::fs::write(case.output.join("Paks/g.utoc"), b"tampered")?;
+        run(&case, CancellationToken::new()).await?;
+        assert_eq!(
+            case.writes.load(Ordering::SeqCst),
+            2,
+            "one bad file redoes both"
+        );
+        assert_eq!(
+            std::fs::metadata(case.output.join("Paks/g.utoc"))?.len(),
+            18
+        );
         Ok(())
     }
 }
