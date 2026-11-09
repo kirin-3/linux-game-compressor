@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "compressor-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "compressor-core",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "compressor-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "clap",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "compressor-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "blake3",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "compressor-engine-godot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "compressor-core",
@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "compressor-engine-renpy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "compressor-core",
  "compressor-media",
@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "compressor-engine-rpgm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "compressor-core",
  "compressor-media",
@@ -551,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "compressor-engine-unity"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "compressor-core",
@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "compressor-engine-unreal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "compressor-core",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "compressor-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "compressor-app",
  "compressor-cli",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "compressor-media"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "compressor-core",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "compressor-test-fixtures"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tempfile",
 ]
