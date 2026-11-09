@@ -24,6 +24,9 @@ Opus, Vorbis or MP3, and video to VP9 WebM. Every file keeps its original name
 and path, so the engine loads the output exactly as before. Your original
 game is never modified.
 
+Unity and Unreal Engine games are different: their game data is compressed
+without loss, and no image, audio or video is re-encoded.
+
 ## Features
 
 - **Drop and go.** Drop game folders on the window, press **Start
@@ -235,8 +238,18 @@ For example, `linux-game-compressor plan "$GAME" --set engines.godot.min_texture
 shows the affected members. See [compatibility](docs/compatibility.md#godot-4)
 for supported packs and resources.
 
+For an Unreal Engine 5 game, use the same commands. `inspect` lists each
+`.ucas`/`.utoc` container and says if it will be compressed or why it will be
+copied. `plan --list` shows a container that will be compressed as a
+`rewrite: unreal-iostore` entry and a `rewrite partner` entry. Only raw
+containers get smaller, so a game that is already compressed is copied with
+no saving. To copy every container, use
+`--set engines.unreal.compress_containers=false`. See
+[compatibility](docs/compatibility.md#unreal-engine) for tested versions and
+limits.
+
 Allow enough disk space for the complete output, staged converted members,
-and a temporary rebuilt pack. Staged members are kept in `.compressor/` for
+and a temporary rebuilt pack or Unreal container. Staged members are kept in `.compressor/` for
 resume and verification.
 
 The output's `.compressor/` directory stores the plan, journal, manifest,
@@ -251,8 +264,8 @@ originals, 2 for usage or precondition errors, and 130 for interruption.
 
 1. **Inspect.** The game's engine and version are detected, and unsupported
    versions are refused.
-2. **Plan.** Every file is classified as convert, copy or remove. Pack members
-   are planned individually.
+2. **Plan.** Every file is classified as convert, copy, remove or rewrite. Pack
+   members are planned individually.
 3. **Compress.** The game is copied to the output folder while eligible files
    are encoded in parallel. Each result is checked, and kept only if it is
    valid and smaller.

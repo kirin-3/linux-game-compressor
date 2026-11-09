@@ -148,12 +148,16 @@ Unreal Engine 5 games are detected from `Content/Paks/*.utoc` containers with an
 
 | Game | Engine | Containers | Result |
 | --- | --- | --- | --- |
-| UNREAL_2 | 5.5 | `EscapeFrom-Windows` raw, `global` raw | 5,722,886,942 to 2,860,270,448 bytes (50.02% saved) in 70 s; `verify` passes (40 files) |
+| UNREAL_2 | 5.5 | `EscapeFrom-Windows` raw, `global` raw | 5,722,886,942 to 2,860,270,448 bytes (50.02% saved) in 70 to 105 s; `verify` passes (40 files); Python's zlib decodes all 94,416 blocks to the input bytes |
 | UNREAL_1 | 5.7.4 | `prealpha-Windows` Oodle, `global` raw | Every file byte-identical to the input; plan notes "already compressed container"; `verify` passes (78 files) |
 
 - **Estimate.** The desktop estimate for UNREAL_2 was 2,878,966,598 bytes against 2,860,270,448 measured (0.65% high). It samples 1,024 evenly spaced blocks; a first try with 32 blocks was 20% low, because compressibility varies across a container.
 - **Load test.** Only UE 5.5 is load-tested: under Proton, the unmodified UNREAL_2, a script-rewritten copy, and the output of this tool all start, load a level and play (user reports, 2026-11-09). Wine 11.21 shows no log or first screen for either copy, so it cannot decide. UE 5.7 has no raw example game, so its containers are only ever copied.
+- **Load speed.** Zlib blocks need more CPU to read than raw blocks. If a game stutters while it loads content, compress it with `--set engines.unreal.compress_containers=false`; every container is then copied unchanged.
 - **Not covered.** Other table-of-contents versions, several partitions, encrypted, signed and already compressed containers are copied unchanged. Movies and other loose files are not converted.
+- **Copy reasons.** `inspect` and the plan notes give one reason for each container that is copied: "compression disabled", "unreadable container", "engine global container", "unsupported container version", "encrypted container", "signed container", "already compressed container", or "unsupported container layout". A symbolic link in place of a `.ucas` counts as unreadable. A method name length other than 32 bytes counts as an unsupported layout.
+- **Several containers.** Each `.ucas`/`.utoc` pair is decided on its own. A pair that fails its check or does not get smaller stays as the input files, and the other pairs are not affected.
+- **Desktop queue.** A game is refused only when all of its game containers have an unsupported version. A game that is already compressed, encrypted or signed is queued, and its details say why it is copied.
 - **`SHA256SUMS.txt`.** Games such as UNREAL_2 ship this file. The game does not read it, but the hashes of the two rewritten files no longer match it.
 - **Never start a game from `example_games/`**: running it writes `Saved/` beside it. Use a copy.
 
@@ -176,5 +180,7 @@ Measured with the three built-in profiles and the balanced compression on the ex
 | UNITY_3 | 783.40 (783.40–783.40) | 783.40 (783.40–783.40) | 783.40 (783.40–783.40) | 735.17 |
 
 GODOT_2 finished 0.41 MiB above the balanced upper bound: sampled media ratios and the rebuilt embedded pack’s overhead did not exactly represent the complete pack. The Unity balanced results fell outside their zero-width ranges because the 32 sampled LZ4HC blocks did not represent the entire player-data archive: UNITY_1 and UNITY_3 compressed better than sampled, while UNITY_2 compressed slightly worse. Archive sampling currently contributes no uncertainty to the range, so these results show that a zero-width range does not imply an exact archive size.
+
+Unreal Engine games are not in this table. Their compression is lossless, so the profile does not change the result. See [Unreal Engine](#unreal-engine) for the UNREAL_2 estimate.
 
 The initial 12-file audio sample on MV_1 overestimated the balanced output; increasing the audio limit to 48 brought its actual result inside the range. Full runs completed with no conversion failures. Estimates are read-only and are not guarantees of the resulting size.
