@@ -48,6 +48,7 @@ pub(super) fn show(
         .resizable(true)
         .default_height(240.0)
         .min_height(140.0)
+        .frame(style::panel_frame(ctx, style::PanelKind::Queue))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Your games");
@@ -55,19 +56,22 @@ pub(super) fn show(
             });
             ui.add_space(4.0);
             if rows.is_empty() {
-                egui::Frame::new()
-                    .fill(style::Palette::current(ctx).card)
-                    .corner_radius(10)
-                    .inner_margin(24)
-                    .show(ui, |ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.strong("Drop your games here");
-                            ui.label("Choose one or more game folders to get started.");
-                            if ui.button("Add games").clicked() {
-                                let _ = worker.send(Command::Pick);
-                            }
-                        });
+                style::card_frame(ctx).inner_margin(24).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("\u{2B07}")
+                                .size(32.0)
+                                .color(style::Palette::current(ctx).muted),
+                        );
+                        ui.label(style::strong("Drop your games here").size(15.0));
+                        ui.label("Choose one or more game folders to get started.");
+                        ui.add_space(4.0);
+                        if style::primary_button(ui, "+  Add games", true).clicked() {
+                            let _ = worker.send(Command::Pick);
+                        }
                     });
+                });
                 return;
             }
             let table_height = (ui.available_height() - 32.0).max(40.0);
@@ -87,15 +91,29 @@ pub(super) fn show(
                 .column(Column::initial(190.0))
                 .column(Column::initial(115.0))
                 .column(Column::exact(45.0))
-                .header(26.0, |mut h| {
-                    for label in ["GAME", "ENGINE", "SIZE", "RESULT", "STATUS", ""] {
+                .header(30.0, |mut h| {
+                    for (i, label) in ["GAME", "ENGINE", "SIZE", "RESULT", "STATUS", ""]
+                        .into_iter()
+                        .enumerate()
+                    {
                         h.col(|ui| {
-                            ui.weak(label);
+                            let rect = ui.max_rect();
+                            ui.painter().hline(
+                                rect.x_range(),
+                                rect.bottom(),
+                                egui::Stroke::new(1.0_f32, palette.border),
+                            );
+                            ui.horizontal(|ui| {
+                                if i == 0 {
+                                    ui.add_space(8.0);
+                                }
+                                ui.label(egui::RichText::new(label).small().color(palette.muted));
+                            });
                         });
                     }
                 })
                 .body(|body| {
-                    body.rows(48.0, rows.len(), |mut r| {
+                    body.rows(52.0, rows.len(), |mut r| {
                         let index = r.index();
                         let row = &rows[index];
                         r.set_selected(selected.as_ref() == Some(&row.path));
@@ -148,16 +166,19 @@ pub(super) fn show(
                                 .file_name()
                                 .unwrap_or(row.path.as_os_str())
                                 .to_string_lossy();
-                            ui.add_space(4.0);
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(name).strong())
-                                    .truncate()
-                                    .selectable(false),
-                            )
-                            .on_hover_text(row.path.display().to_string());
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(8.0);
+                                ui.add(
+                                    egui::Label::new(style::strong(name))
+                                        .truncate()
+                                        .selectable(false),
+                                )
+                                .on_hover_text(row.path.display().to_string());
+                            });
                         });
                         r.col(|ui| {
-                            ui.add_space(4.0);
+                            ui.add_space(8.0);
                             if let Some(info) = &row.inspection {
                                 ui.label(format!(
                                     "{} {}",
@@ -169,7 +190,7 @@ pub(super) fn show(
                             }
                         });
                         r.col(|ui| {
-                            ui.add_space(4.0);
+                            ui.add_space(8.0);
                             if let Some(info) = &row.inspection {
                                 ui.label(size(i128::from(info.bytes)));
                             } else {
@@ -177,7 +198,7 @@ pub(super) fn show(
                             }
                         });
                         r.col(|ui| {
-                            ui.add_space(4.0);
+                            ui.add_space(8.0);
                             if row.running {
                                 let p = &row.progress;
                                 let f = if p.total == 0 {
@@ -267,7 +288,7 @@ pub(super) fn show(
                             } else {
                                 p.accent
                             };
-                            ui.add_space(2.0);
+                            ui.add_space(6.0);
                             ui.vertical(|ui| {
                                 let label = if !row.running && show_missing {
                                     "Needs tools"
@@ -337,13 +358,13 @@ pub(super) fn show(
                 } else {
                     saved as f64 * 100.0 / totals.input as f64
                 };
-                ui.strong(format!(
+                ui.label(style::strong(format!(
                     "Total  {} in  ·  {}{} out  ·  {} saved ({percent:.0}%)",
                     size(totals.input.into()),
                     if totals.estimated { "~" } else { "" },
                     size(totals.output.into()),
                     size(saved)
-                ));
+                )));
             }
         });
     action

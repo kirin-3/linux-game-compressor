@@ -143,9 +143,11 @@ fn estimate_text(row: &Row, key: &str) -> String {
             size(e.high.into())
         )
     } else if row.estimating {
-        "Estimating…".into()
+        // Keep two lines, like a finished estimate, so the controls below do
+        // not move under the pointer when an estimate starts or finishes.
+        "Estimating…\n ".into()
     } else {
-        "Estimate unavailable".into()
+        "Estimate unavailable\n ".into()
     }
 }
 pub(super) fn show(ui: &mut egui::Ui, row: &mut Row) -> bool {
@@ -154,10 +156,10 @@ pub(super) fn show(ui: &mut egui::Ui, row: &mut Row) -> bool {
     ui.heading("How much to compress?");
     if !row.overrides.is_empty() {
         ui.horizontal(|ui| {
-            ui.strong(format!(
+            ui.label(style::strong(format!(
                 "Custom (based on {})",
                 labels::profile(&row.profile).0
-            ));
+            )));
             if ui
                 .button(format!("Back to {}", labels::profile(&row.profile).0))
                 .clicked()
@@ -171,47 +173,35 @@ pub(super) fn show(ui: &mut egui::Ui, row: &mut Row) -> bool {
         for (index, profile) in ["quality", "balanced", "small"].iter().enumerate() {
             let (name, description) = labels::profile(profile);
             let palette = style::Palette::current(cols[index].ctx());
-            egui::Frame::new()
-                .fill(palette.card)
-                .stroke(egui::Stroke::new(
-                    if row.profile == *profile && row.overrides.is_empty() {
-                        2.0_f32
+            let card = style::card_frame(cols[index].ctx()).inner_margin(12);
+            let card = if row.profile == *profile && row.overrides.is_empty() {
+                card.stroke(egui::Stroke::new(2.0_f32, palette.accent))
+            } else {
+                card
+            };
+            card.show(&mut cols[index], |ui| {
+                // Columns are justified; left-align so wrapped text is not stretched.
+                ui.set_width(ui.available_width());
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_min_height(112.0);
+                    let selected = row.profile == *profile && row.overrides.is_empty();
+                    let name = if selected {
+                        style::strong(name).color(palette.on_accent)
                     } else {
-                        0.0_f32
-                    },
-                    palette.accent,
-                ))
-                .corner_radius(10)
-                .inner_margin(12)
-                .show(&mut cols[index], |ui| {
-                    // Columns are justified; left-align so wrapped text is not stretched.
-                    ui.set_width(ui.available_width());
-                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                        ui.set_min_height(112.0);
-                        let selected = row.profile == *profile && row.overrides.is_empty();
-                        let name = if selected {
-                            egui::RichText::new(name)
-                                .strong()
-                                .color(if ui.visuals().dark_mode {
-                                    palette.panel
-                                } else {
-                                    palette.overlay_text
-                                })
-                        } else {
-                            egui::RichText::new(name).strong()
-                        };
-                        if ui.selectable_label(selected, name).clicked()
-                            && (row.profile != *profile || !row.overrides.is_empty())
-                        {
-                            row.profile = (*profile).into();
-                            row.overrides.clear();
-                            changed = true;
-                        }
-                        ui.label(description);
-                        ui.add_space(6.0);
-                        ui.colored_label(palette.accent, estimate_text(row, profile));
-                    });
+                        style::strong(name)
+                    };
+                    if ui.selectable_label(selected, name).clicked()
+                        && (row.profile != *profile || !row.overrides.is_empty())
+                    {
+                        row.profile = (*profile).into();
+                        row.overrides.clear();
+                        changed = true;
+                    }
+                    ui.label(description);
+                    ui.add_space(6.0);
+                    ui.colored_label(palette.accent, estimate_text(row, profile));
                 });
+            });
         }
     });
     if !row.overrides.is_empty() {
@@ -235,7 +225,7 @@ pub(super) fn show(ui: &mut egui::Ui, row: &mut Row) -> bool {
         if !media_present(row, group) {
             continue;
         }
-        ui.strong(heading);
+        ui.label(style::strong(heading));
         settings_grid(ui, group, |ui| {
             for (key, value) in settings
                 .values
@@ -258,7 +248,7 @@ pub(super) fn show(ui: &mut egui::Ui, row: &mut Row) -> bool {
     }
     if let Some(options) = specs.get(&engine) {
         if !options.is_empty() {
-            ui.strong(format!("{engine_name} options"));
+            ui.label(style::strong(format!("{engine_name} options")));
             settings_grid(ui, "engine", |ui| {
                 for option in options {
                     if let Some(value) = settings.engine_options.get(&option.name) {

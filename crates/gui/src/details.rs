@@ -9,44 +9,66 @@ pub(super) fn show(app: &mut App, ctx: &egui::Context) -> Option<PathBuf> {
         .filter(|r| app.selected.as_ref() != Some(&r.path))
         .filter_map(|r| r.output.clone())
         .collect();
-    egui::CentralPanel::default().show(ctx, |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let Some(row) = app
-                .queue
-                .iter_mut()
-                .find(|r| app.selected.as_ref() == Some(&r.path))
-            else {
-                ui.add_space(20.0);
-                ui.vertical_centered(|ui| {
-                    ui.heading("Select a game");
-                    ui.colored_label(
-                        style::Palette::current(ctx).muted,
-                        "Choose a game above to review its settings and progress.",
-                    );
+    egui::CentralPanel::default()
+        .frame(style::panel_frame(ctx, style::PanelKind::Detail))
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                let Some(row) = app
+                    .queue
+                    .iter_mut()
+                    .find(|r| app.selected.as_ref() == Some(&r.path))
+                else {
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("\u{2B06}")
+                                .size(28.0)
+                                .color(style::Palette::current(ctx).muted),
+                        );
+                        ui.heading("Select a game");
+                        ui.colored_label(
+                            style::Palette::current(ctx).muted,
+                            "Choose a game above to review its settings and progress.",
+                        );
+                    });
+                    return;
+                };
+                style::card(ui, |ui| {
+                    header(ui, row, &app.worker.commands, &app.queue_worker.commands);
+                    inspection(ui, row);
                 });
-                return;
-            };
-            egui::Frame::new().inner_margin(16).show(ui, |ui| {
-                header(ui, row, &app.worker.commands, &app.queue_worker.commands);
-                inspection(ui, row);
-                output(ui, row, &others, &app.worker.commands);
-                result(ui, row);
-                if row.running {
-                    ui.strong("Processing");
-                    for path in &row.progress.active {
-                        ui.weak(path);
-                    }
+                style::card(ui, |ui| output(ui, row, &others, &app.worker.commands));
+                if has_result(row) {
+                    style::card(ui, |ui| {
+                        result(ui, row);
+                        if row.running {
+                            ui.label(style::strong("Processing"));
+                            for path in &row.progress.active {
+                                ui.weak(path);
+                            }
+                        }
+                    });
                 }
-                ui.add_enabled_ui(!row.running, |ui| {
-                    ui.checkbox(&mut row.verify, "Verify this game");
-                    if settings_view::show(ui, row) {
-                        changed = Some(row.path.clone());
-                    }
+                style::card(ui, |ui| {
+                    ui.add_enabled_ui(!row.running, |ui| {
+                        ui.checkbox(&mut row.verify, "Verify this game");
+                        if settings_view::show(ui, row) {
+                            changed = Some(row.path.clone());
+                        }
+                    });
                 });
             });
         });
-    });
     changed
+}
+
+/// Whether the result card has anything to show.
+fn has_result(row: &Row) -> bool {
+    row.running
+        || row.verification.is_some()
+        || row.report.as_ref().is_some_and(|report| {
+            row.finished || !report.failures.is_empty() || !report.skips.is_empty()
+        })
 }
 
 fn header(
@@ -265,13 +287,12 @@ fn result(ui: &mut egui::Ui, row: &Row) {
         } else {
             saved as f64 * 100.0 / report.input_bytes as f64
         };
-        ui.add_space(8.0);
-        ui.strong(format!(
+        ui.label(style::strong(format!(
             "{} -> {}  ·  {} saved ({percent:.0}%)",
             size(report.input_bytes.into()),
             size(report.output_bytes.into()),
             size(saved)
-        ));
+        )));
         ui.add(
             egui::ProgressBar::new(fraction).text(format!("{:.0}% of original", fraction * 100.0)),
         );

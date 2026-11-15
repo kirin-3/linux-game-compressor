@@ -54,11 +54,10 @@ impl Toasts {
                         Kind::Warning => palette.warning,
                         Kind::Error => palette.error,
                     };
-                    egui::Frame::new()
-                        .fill(palette.card)
+                    style::card_frame(ctx)
                         .stroke(egui::Stroke::new(1.0_f32, color))
-                        .corner_radius(10)
                         .inner_margin(12)
+                        .shadow(ctx.style().visuals.popup_shadow)
                         .show(ui, |ui| {
                             ui.set_max_width(380.0);
                             ui.horizontal(|ui| {
@@ -70,7 +69,12 @@ impl Toasts {
                                         Kind::Error => "Error",
                                     },
                                 );
-                                ui.label(&toast.message);
+                                // A horizontal layout does not wrap, so a long path
+                                // would push the toast past the window's left edge.
+                                ui.vertical(|ui| {
+                                    ui.set_max_width(300.0);
+                                    ui.add(egui::Label::new(&toast.message).wrap());
+                                });
                                 if ui.small_button("×").clicked() {
                                     remove = Some(i);
                                 }
